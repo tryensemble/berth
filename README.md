@@ -12,8 +12,8 @@ project's repository are stored once and shared by all of them.
 
 A berth is not a virtual machine. It reserves no memory, boots no kernel and
 copies no disk image. It costs what its programs use, as if they ran in a
-worktree on the same server. A berth starts in about 40 ms (130 ms with a
-checkout of its project), and its init takes under 2 MB of memory, so one
+worktree on the same server. A berth starts in about 30 ms, a command in it
+returns in about 4 ms, and 30 idle berths together hold under 20 MB, so one
 machine can hold dozens to hundreds of them.
 
 ```console
@@ -43,6 +43,22 @@ $ berth forward 6ae0756e 3000                          # http://127.0.0.1:3000 o
 - [Development](#development)
 - [Roadmap](#roadmap)
 - [License](#license)
+
+## Numbers
+
+On an 8-thread cloud VM, Ubuntu 24.04, berths made from a layer with git and
+Node:
+
+| | |
+|---|---|
+| Create a berth | ~30 ms |
+| Run a command in one | ~4 ms |
+| Wake an idle berth | a few ms |
+| 30 berths, each running a server | ~28 MB total (~0.9 MB each) |
+| 30 berths, idle | ~16 MB total (~0.5 MB each) |
+
+A berth reserves none of this: it costs what its own programs use. Measure
+your own with `make e2e` and `berth ls`.
 
 ## Why
 
