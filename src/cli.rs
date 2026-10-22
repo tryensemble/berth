@@ -64,7 +64,7 @@ pub enum Cmd {
         /// Give it a terminal
         #[arg(short, long)]
         tty: bool,
-        /// KEY=VALUE (repeatable)
+        /// KEY=VALUE, or KEY to pass this shell's value on (repeatable)
         #[arg(short, long = "env")]
         env: Vec<String>,
         #[arg(short = 'w', long = "workdir")]
@@ -167,6 +167,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Cmd::Exec { id, tty, env, workdir, user, detach, name, cmd } => {
             let (rows, cols) = if tty { terminal_size() } else { (0, 0) };
+            let env = resolve_env(env, |k| std::env::var(k).ok());
             exec(&api, &id, ExecSpec { argv: cmd, env, cwd: workdir, user, tty, rows, cols, detach, name })
         }
         Cmd::Ports { id, json } => {
@@ -242,6 +243,14 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
 
 fn proxy(api: &Client, id: &str, port: u16) -> anyhow::Result<UnixStream> {
     api.upgrade(&format!("/v1/berths/{id}/proxy"), &json!({ "port": port }))
+}
+
+/// Fills in `KEY` entries from lookup, as `docker run -e KEY` does; a KEY
+/// lookup doesn't know is left out.
+fn resolve_env(env: Vec<String>, lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    env.into_iter()
+        .filter_map(|kv| if kv.contains('=') { Some(kv) } else { lookup(&kv).map(|v| format!("{kv}={v}")) })
+        .collect()
 }
 
 fn terminal_size() -> (u16, u16) {
@@ -350,6 +359,13 @@ mod tests {
         assert_eq!((id.as_str(), tty), ("ab12", true));
         assert_eq!(env, ["A=1"]);
         assert_eq!(cmd, ["ls", "-la"]);
+    }
+
+    #[test]
+    fn bare_env_names_take_the_callers_value() {
+        let lookup = |k: &str| (k == "API_KEY").then(|| "secret=1".to_string());
+        let env = resolve_env(vec!["A=1".into(), "API_KEY".into(), "UNSET".into(), "B=".into()], lookup);
+        assert_eq!(env, ["A=1", "API_KEY=secret=1", "B="]);
     }
 
     #[test]
