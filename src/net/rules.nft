@@ -1,0 +1,27 @@
+# berth's nftables rules, loaded by berthd at start. Berths sit on the bridge
+# berth0 (10.200.0.0/16): they reach the internet through NAT, and nothing
+# else - not the host, not each other, not private or link-local networks.
+table inet berth {
+  # Host ports berths may reach on their gateway (a secrets proxy, say).
+  set host_ports { type inet_service; }
+
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "berth0" ct state established,related accept
+    iifname "berth0" meta l4proto icmp accept
+    iifname "berth0" tcp dport @host_ports accept
+    iifname "berth0" drop
+  }
+
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "berth0" oifname "berth0" drop
+    iifname "berth0" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8 } drop
+    iifname "berth0" meta nfproto ipv6 drop
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    ip saddr 10.200.0.0/16 oifname != "berth0" masquerade
+  }
+}

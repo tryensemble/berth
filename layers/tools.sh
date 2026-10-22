@@ -1,6 +1,6 @@
 # A tools layer for agent threads: git, Node and Claude Code, and the agent
 # user (uid 1000) commands run as by default.
-#   berth layer tools examples/tools.sh
+#   berth layer tools layers/tools.sh
 set -e
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl git xz-utils procps iproute2 less >/dev/null

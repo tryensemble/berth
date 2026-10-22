@@ -1,25 +1,26 @@
 //! berth, the command line: a client of berthd's socket.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use crate::proto::{self, ExecSpec};
+use crate::api::{Client, ExecSpec, frames};
+use crate::pipe;
 
 #[derive(Parser)]
 #[command(name = "berth", version, about = "Light, isolated boxes for agent threads on one Linux machine")]
 pub struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    pub cmd: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+pub enum Cmd {
     /// Run the daemon (as root)
     Daemon,
     /// Pull an OCI image berths can be made from
@@ -71,7 +72,7 @@ enum Cmd {
         /// User in the berth (agent by default)
         #[arg(short, long)]
         user: Option<String>,
-        /// Leave it running; output goes to /var/log/berth/<name>.log in the berth
+        /// Leave it running; output goes to /var/log/berth/NAME.log in the berth
         #[arg(short, long)]
         detach: bool,
         #[arg(long)]
@@ -109,7 +110,12 @@ enum Cmd {
 }
 
 pub fn main() -> anyhow::Result<i32> {
-    let cli = Cli::parse();
+    run(Cli::parse())
+}
+
+/// Runs a parsed command line; returns the exit code.
+pub fn run(cli: Cli) -> anyhow::Result<i32> {
+    let api = Client::default();
     match cli.cmd {
         Cmd::Daemon => crate::daemon::main().map(|_| 0),
         Cmd::Init => crate::init::main().map(|_| 0),
@@ -118,17 +124,17 @@ pub fn main() -> anyhow::Result<i32> {
             Ok(0)
         }
         Cmd::Pull { reference } => {
-            let v = proto::call_json("POST", "/v1/images", Some(&json!({ "reference": reference })))?;
+            let v = api.json("POST", "/v1/images", Some(&json!({ "reference": reference })))?;
             println!("{}", v["rootfs"].as_str().unwrap_or(""));
             Ok(0)
         }
         Cmd::Repo { name, url } => {
-            proto::call_json("POST", "/v1/repos", Some(&json!({ "name": name, "url": url })))?;
+            api.json("POST", "/v1/repos", Some(&json!({ "name": name, "url": url })))?;
             Ok(0)
         }
         Cmd::Layer { name, script, image, from } => {
             let script = std::fs::read_to_string(&script).with_context(|| format!("reading {}", script.display()))?;
-            let b = proto::call_json("POST", "/v1/berths", Some(&json!({ "image": image, "layers": from })))?;
+            let b = api.json("POST", "/v1/berths", Some(&json!({ "image": image, "layers": from })))?;
             let id = b["id"].as_str().context("no id")?.to_string();
             eprintln!("berth: building layer {name} in berth {id}");
             let spec = ExecSpec {
@@ -138,17 +144,17 @@ pub fn main() -> anyhow::Result<i32> {
                 env: vec!["DEBIAN_FRONTEND=noninteractive".into()],
                 ..Default::default()
             };
-            let code = exec(&id, spec)?;
+            let code = exec(&api, &id, spec)?;
             if code != 0 {
-                let _ = proto::call_json("DELETE", &format!("/v1/berths/{id}"), None);
+                let _ = api.json("DELETE", &format!("/v1/berths/{id}"), None);
                 bail!("the script failed with exit code {code}");
             }
-            proto::call_json("POST", "/v1/layers", Some(&json!({ "berth": id, "name": name })))?;
+            api.json("POST", "/v1/layers", Some(&json!({ "berth": id, "name": name })))?;
             eprintln!("berth: layer {name} is ready");
             Ok(0)
         }
         Cmd::Create { project, branch, image, layers, cpus, memory, pids, tmp } => {
-            let v = proto::call_json(
+            let v = api.json(
                 "POST",
                 "/v1/berths",
                 Some(&json!({
@@ -161,10 +167,10 @@ pub fn main() -> anyhow::Result<i32> {
         }
         Cmd::Exec { id, tty, env, workdir, user, detach, name, cmd } => {
             let (rows, cols) = if tty { terminal_size() } else { (0, 0) };
-            exec(&id, ExecSpec { argv: cmd, env, cwd: workdir, user, tty, rows, cols, detach, name })
+            exec(&api, &id, ExecSpec { argv: cmd, env, cwd: workdir, user, tty, rows, cols, detach, name })
         }
         Cmd::Ports { id, json } => {
-            let v = proto::call_json("GET", &format!("/v1/berths/{id}/ports"), None)?;
+            let v = api.json("GET", &format!("/v1/berths/{id}/ports"), None)?;
             if json {
                 println!("{}", v["ports"]);
             } else {
@@ -175,7 +181,7 @@ pub fn main() -> anyhow::Result<i32> {
             Ok(0)
         }
         Cmd::Proxy { id, port } => {
-            let conn = proxy(&id, port)?;
+            let conn = proxy(&api, &id, port)?;
             let mut up = conn.try_clone()?;
             std::thread::spawn(move || {
                 let _ = std::io::copy(&mut std::io::stdin(), &mut up);
@@ -191,35 +197,42 @@ pub fn main() -> anyhow::Result<i32> {
             for client in listener.incoming() {
                 let Ok(client) = client else { continue };
                 let id = id.clone();
-                std::thread::spawn(move || {
-                    match proxy(&id, port) {
-                        Ok(conn) => join(client, conn),
-                        Err(e) => eprintln!("berth: {e:#}"),
+                // Each connection on its own, so a slow one holds up no other;
+                // one that fails is reported and the forward goes on.
+                std::thread::spawn(move || match proxy(&Client::default(), &id, port) {
+                    Ok(conn) => {
+                        let _ = pipe::splice(client, conn);
                     }
+                    Err(e) => eprintln!("berth: {e:#}"),
                 });
             }
             Ok(0)
         }
         Cmd::Destroy { ids } => {
             for id in ids {
-                proto::call_json("DELETE", &format!("/v1/berths/{id}"), None)?;
+                api.json("DELETE", &format!("/v1/berths/{id}"), None)?;
             }
             Ok(0)
         }
         Cmd::Ls { json } => {
-            let v = proto::call_json("GET", "/v1/berths", None)?;
+            let v = api.json("GET", "/v1/berths", None)?;
             if json {
                 println!("{v}");
                 return Ok(0);
             }
-            println!("{:<10} {:<8} {:<14} {:<12} {:<16} {}", "ID", "STATUS", "ADDRESS", "PROJECT", "BRANCH", "LAYERS");
+            println!("{:<10} {:<8} {:<14} {:<12} {:<16} LAYERS", "ID", "STATUS", "ADDRESS", "PROJECT", "BRANCH");
             for b in v.as_array().into_iter().flatten() {
                 let s = |k: &str| b[k].as_str().unwrap_or("-").to_string();
                 let layers: Vec<String> =
                     b["layers"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
                 println!(
                     "{:<10} {:<8} {:<14} {:<12} {:<16} {}",
-                    s("id"), s("status"), s("ip"), s("project"), s("branch"), layers.join(",")
+                    s("id"),
+                    s("status"),
+                    s("ip"),
+                    s("project"),
+                    s("branch"),
+                    layers.join(",")
                 );
             }
             Ok(0)
@@ -227,29 +240,13 @@ pub fn main() -> anyhow::Result<i32> {
     }
 }
 
-fn proxy(id: &str, port: u16) -> anyhow::Result<UnixStream> {
-    proto::call_upgrade(&format!("/v1/berths/{id}/proxy"), &json!({ "port": port }))
-}
-
-fn join(tcp: TcpStream, unix: UnixStream) {
-    let (mut t_in, mut u_out) = (tcp.try_clone().unwrap(), unix.try_clone().unwrap());
-    let up = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut t_in, &mut u_out);
-        let _ = u_out.shutdown(Shutdown::Write);
-    });
-    let (mut u_in, mut t_out) = (unix, tcp);
-    let _ = std::io::copy(&mut u_in, &mut t_out);
-    let _ = t_out.shutdown(Shutdown::Write);
-    let _ = up.join();
+fn proxy(api: &Client, id: &str, port: u16) -> anyhow::Result<UnixStream> {
+    api.upgrade(&format!("/v1/berths/{id}/proxy"), &json!({ "port": port }))
 }
 
 fn terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 {
-        (ws.ws_row, ws.ws_col)
-    } else {
-        (24, 80)
-    }
+    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 { (ws.ws_row, ws.ws_col) } else { (24, 80) }
 }
 
 /// Puts the terminal in raw mode while it lives.
@@ -282,10 +279,10 @@ impl Drop for Raw {
 }
 
 /// Runs spec in a berth, wired to this process's stdio. Returns its exit code.
-fn exec(id: &str, spec: ExecSpec) -> anyhow::Result<i32> {
+fn exec(api: &Client, id: &str, spec: ExecSpec) -> anyhow::Result<i32> {
     let detach = spec.detach;
     let tty = spec.tty;
-    let mut conn = proto::call_upgrade(&format!("/v1/berths/{id}/exec"), &serde_json::to_value(&spec)?)?;
+    let mut conn = api.upgrade(&format!("/v1/berths/{id}/exec"), &serde_json::to_value(&spec)?)?;
     let raw = if tty { Raw::enter() } else { Raw(None) };
     if !detach {
         let mut up = conn.try_clone()?;
@@ -295,11 +292,11 @@ fn exec(id: &str, spec: ExecSpec) -> anyhow::Result<i32> {
             loop {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        let _ = proto::write_frame(&mut up, proto::EOF, &[]);
+                        let _ = frames::write_frame(&mut up, frames::EOF, &[]);
                         break;
                     }
                     Ok(n) => {
-                        if proto::write_frame(&mut up, proto::STDIN, &buf[..n]).is_err() {
+                        if frames::write_frame(&mut up, frames::STDIN, &buf[..n]).is_err() {
                             break;
                         }
                     }
@@ -309,29 +306,57 @@ fn exec(id: &str, spec: ExecSpec) -> anyhow::Result<i32> {
     }
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     let code = loop {
-        match proto::read_frame(&mut conn)? {
-            Some((proto::STDOUT, d)) => {
+        match frames::read_frame(&mut conn)? {
+            Some((frames::STDOUT, d)) => {
                 out.write_all(&d)?;
                 out.flush()?;
             }
-            Some((proto::STDERR, d)) => {
+            Some((frames::STDERR, d)) => {
                 err.write_all(&d)?;
                 err.flush()?;
             }
-            Some((proto::STARTED, d)) if detach && d.len() == 4 => {
+            Some((frames::STARTED, d)) if detach && d.len() == 4 => {
                 println!("{}", u32::from_be_bytes(d.try_into().unwrap()));
                 break 0;
             }
-            Some((proto::ERROR, d)) => {
+            Some((frames::ERROR, d)) => {
                 drop(raw);
                 eprintln!("berth: {}", String::from_utf8_lossy(&d));
                 return Ok(127);
             }
-            Some((proto::EXIT, d)) if d.len() == 4 => break i32::from_be_bytes(d.try_into().unwrap()),
+            Some((frames::EXIT, d)) if d.len() == 4 => break i32::from_be_bytes(d.try_into().unwrap()),
             Some(_) => {}
             None => break 255,
         }
     };
     drop(raw);
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn exec_takes_the_rest_as_the_command() {
+        let cli = Cli::try_parse_from(["berth", "exec", "-t", "-e", "A=1", "ab12", "--", "ls", "-la"]).unwrap();
+        let Cmd::Exec { id, tty, env, cmd, .. } = cli.cmd else { panic!("not exec") };
+        assert_eq!((id.as_str(), tty), ("ab12", true));
+        assert_eq!(env, ["A=1"]);
+        assert_eq!(cmd, ["ls", "-la"]);
+    }
+
+    #[test]
+    fn create_has_light_defaults() {
+        let cli = Cli::try_parse_from(["berth", "create", "--layer", "tools"]).unwrap();
+        let Cmd::Create { image, layers, cpus, memory, .. } = cli.cmd else { panic!("not create") };
+        assert_eq!((image.as_str(), cpus, memory.as_str()), ("ubuntu:24.04", 2.0, "4G"));
+        assert_eq!(layers, ["tools"]);
+    }
 }
