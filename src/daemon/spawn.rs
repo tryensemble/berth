@@ -2,17 +2,18 @@
 //! handed to that init.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 
 use super::UID_COUNT;
 use super::berth::Berth;
-use crate::api::{ExecSpec, frames};
+use crate::api::{ExecSpec, InitRequest, frames};
 use crate::init::{InitConfig, LISTEN_FD};
 use crate::sys;
 
@@ -97,9 +98,49 @@ pub fn spawn_init(
 
 /// Hands an exec request and the stream to speak frames on to the berth's init.
 pub fn hand_to_init(b: &Berth, spec: &ExecSpec, stream_fd: i32) -> anyhow::Result<()> {
-    let control = UnixStream::connect(b.run_dir().join("init.sock")).context("reaching the berth's init")?;
-    sys::send_with_fd(&control, &serde_json::to_vec(spec)?, stream_fd)?;
+    let control = connect(b)?;
+    let req = InitRequest::Exec(spec.clone());
+    sys::send_with_fd(&control, &serde_json::to_vec(&req)?, stream_fd)?;
     Ok(())
+}
+
+fn connect(b: &Berth) -> anyhow::Result<UnixStream> {
+    let control = UnixStream::connect(b.run_dir().join("init.sock")).context("reaching the berth's init")?;
+    control.set_read_timeout(Some(Duration::from_secs(30)))?;
+    Ok(control)
+}
+
+/// Sends init a request that takes no stream, and waits for its answer.
+pub fn ask_init(b: &Berth, req: &InitRequest) -> anyhow::Result<()> {
+    let mut control = connect(b)?;
+    control.write_all(&serde_json::to_vec(req)?)?;
+    // init answers "ok" or a short error. Read a bounded amount so a berth
+    // that got hold of init can't trickle forever or exhaust memory.
+    let mut answer = String::new();
+    control.take(4096).read_to_string(&mut answer)?;
+    if answer.trim() != "ok" {
+        bail!("the berth's init refused: {}", answer.trim());
+    }
+    Ok(())
+}
+
+/// Starts a detached command or a service in the berth; returns its pid there.
+pub fn start_detached(b: &Berth, spec: &ExecSpec) -> anyhow::Result<u32> {
+    let mut spec = spec.clone();
+    spec.detach = true;
+    let (mut mine, theirs) = UnixStream::pair()?;
+    mine.set_read_timeout(Some(Duration::from_secs(30)))?;
+    hand_to_init(b, &spec, theirs.as_raw_fd())?;
+    drop(theirs);
+    let mut error = String::new();
+    while let Some((kind, data)) = frames::read_frame(&mut mine)? {
+        match kind {
+            frames::STARTED if data.len() == 4 => return Ok(u32::from_be_bytes(data.try_into().unwrap())),
+            frames::ERROR => error.push_str(&String::from_utf8_lossy(&data)),
+            _ => {}
+        }
+    }
+    bail!("couldn't start {}: {error}", spec.argv.first().map_or("", |s| s.as_str()))
 }
 
 /// Runs a command in a berth and collects its exit code and output.

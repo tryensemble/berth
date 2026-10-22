@@ -31,6 +31,37 @@ pub fn find(passwd: &str, user: &str) -> Option<User> {
     })
 }
 
+/// A group's id by name, from the berth's /etc/group.
+pub fn group_id(name: &str) -> Option<libc::gid_t> {
+    let group = std::fs::read_to_string("/etc/group").ok()?;
+    group.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() == 4 && f[0] == name).then(|| f[2].parse().ok()).flatten()
+    })
+}
+
+/// The supplementary groups of user from the berth's /etc/group.
+pub fn groups(user: &User) -> Vec<libc::gid_t> {
+    member_of(&std::fs::read_to_string("/etc/group").unwrap_or_default(), user)
+}
+
+/// The groups that list user as a member in the text of a group file, and its
+/// own group.
+pub fn member_of(group: &str, user: &User) -> Vec<libc::gid_t> {
+    let mut gids = vec![user.gid];
+    for l in group.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() == 4
+            && f[3].split(',').any(|m| m == user.name)
+            && let Ok(gid) = f[2].parse()
+            && !gids.contains(&gid)
+        {
+            gids.push(gid);
+        }
+    }
+    gids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +78,13 @@ agent:x:1000:1000::/home/agent:/bin/bash
             User { uid: 1000, gid: 1000, name: "agent".into(), home: "/home/agent".into(), shell: "/bin/bash".into() };
         assert_eq!(find(PASSWD, "agent"), Some(agent));
         assert_eq!(find(PASSWD, "0").map(|u| u.name), Some("root".into()));
+    }
+
+    #[test]
+    fn supplementary_groups_come_from_the_group_file() {
+        let agent = find(PASSWD, "agent").unwrap();
+        let group = "root:x:0:\nsudo:x:27:agent\ndocker:x:998:other,agent\nother:x:5:other\nbad:x\n";
+        assert_eq!(member_of(group, &agent), [1000, 27, 998]);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::paths;
+use crate::api::ExecSpec;
 use crate::sys;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -37,7 +38,18 @@ pub struct CreateSpec {
     pub pids: u32,
     #[serde(default = "default_tmp")]
     pub tmp: String,
+    /// Freeze the berth after this long unused, like `5m`; `0` never does.
+    pub idle_after: Option<String>,
+    /// Stop it after this long unused, like `12h`; `0` never does.
+    pub stop_after: Option<String>,
+    /// Whose berth it is: berths of one tenant share caches and a registry
+    /// mirror, never anything else.
+    pub tenant: Option<String>,
 }
+
+/// How long a berth may go unused before it's frozen, and before it's stopped.
+pub const DEFAULT_IDLE_AFTER: u64 = 5 * 60;
+pub const DEFAULT_STOP_AFTER: u64 = 12 * 60 * 60;
 
 fn default_image() -> String {
     "ubuntu:24.04".into()
@@ -55,6 +67,30 @@ fn default_tmp() -> String {
     "1G".into()
 }
 
+/// Where a berth is in its life.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// Its programs run.
+    #[default]
+    Running,
+    /// Frozen, its memory pushed out: no CPU, a few MB, back instantly.
+    Idle,
+    /// Nothing runs; only its files are kept. Back in a second, with its
+    /// services.
+    Stopped,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Running => "running",
+            State::Idle => "idle",
+            State::Stopped => "stopped",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Berth {
     pub id: String,
@@ -70,6 +106,25 @@ pub struct Berth {
     pub layers: Vec<String>,
     pub limits: Limits,
     pub created: u64,
+    #[serde(default)]
+    pub state: State,
+    /// Seconds unused before it's frozen and before it's stopped; 0 is never.
+    #[serde(default = "default_idle_after")]
+    pub idle_after: u64,
+    #[serde(default = "default_stop_after")]
+    pub stop_after: u64,
+    /// What runs again whenever the berth starts.
+    #[serde(default)]
+    pub services: Vec<ExecSpec>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+fn default_idle_after() -> u64 {
+    DEFAULT_IDLE_AFTER
+}
+fn default_stop_after() -> u64 {
+    DEFAULT_STOP_AFTER
 }
 
 impl Berth {
@@ -98,10 +153,15 @@ impl Berth {
         Ok(())
     }
 
-    /// The berth as the API shows it.
+    /// The berth as the API shows it, with what it uses now.
     pub fn view(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap();
-        v["status"] = json!(if self.alive() { "running" } else { "dead" });
+        let state = match self.state {
+            State::Running | State::Idle if !self.alive() => State::Stopped,
+            s => s,
+        };
+        v["status"] = json!(state.as_str());
+        v["memory"] = json!(super::cgroup::memory_current(self));
         v
     }
 }
@@ -118,6 +178,20 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let n: f64 = num.parse().with_context(|| format!("bad size {s}"))?;
     anyhow::ensure!(n.is_finite() && n >= 0.0, "bad size {s}");
     Ok((n * mult as f64) as u64)
+}
+
+/// A duration like `90`, `30s`, `5m`, `12h` or `2d`, in seconds.
+pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        _ => (s, 1),
+    };
+    let n: u64 = num.parse().with_context(|| format!("bad duration {s}"))?;
+    n.checked_mul(mult).with_context(|| format!("bad duration {s}"))
 }
 
 /// A short random id, like `6ae0756e`.
@@ -144,6 +218,29 @@ mod tests {
         for bad in ["", "G", "lots", "-1G", "NaNG"] {
             assert!(parse_size(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn durations_parse() {
+        assert_eq!(parse_duration("90").unwrap(), 90);
+        assert_eq!(parse_duration("30s").unwrap(), 30);
+        assert_eq!(parse_duration("5m").unwrap(), 300);
+        assert_eq!(parse_duration("12h").unwrap(), 43200);
+        assert_eq!(parse_duration("2d").unwrap(), 172800);
+        assert_eq!(parse_duration("0").unwrap(), 0);
+        for bad in ["", "m", "-5m", "1.5h", "5w", "99999999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn records_from_before_states_load_as_running() {
+        let old = r#"{"id":"ab","n":2,"uid_base":1131072,"ip":"10.200.0.2","pid":0,"project":null,"branch":null,
+            "image":"ubuntu:24.04","layers":[],"limits":{"cpus":2.0,"memory":"4G","pids":4096,"tmp":"1G"},"created":0}"#;
+        let b: Berth = serde_json::from_str(old).unwrap();
+        assert_eq!(b.state, State::Running);
+        assert_eq!((b.idle_after, b.stop_after), (DEFAULT_IDLE_AFTER, DEFAULT_STOP_AFTER));
+        assert!(b.services.is_empty());
     }
 
     #[test]

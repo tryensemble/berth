@@ -1,7 +1,10 @@
 //! Thin wrappers over the Linux calls berth needs that std doesn't have.
 
+pub mod beneath;
 mod fd;
+pub mod landlock;
 mod mount;
+pub mod seccomp;
 
 use std::ffi::CString;
 use std::io;

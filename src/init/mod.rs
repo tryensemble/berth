@@ -5,10 +5,12 @@
 //! berth. Commands are its children, not the daemon's, so they outlive the
 //! daemon.
 
+pub mod docker;
 mod exec;
 mod passwd;
 mod reaper;
 mod rootfs;
+mod services;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -19,9 +21,10 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ExecSpec, Frames, frames};
+use crate::api::{Frames, InitRequest, frames};
 use crate::sys;
 use reaper::Reaper;
+use services::Services;
 
 /// The descriptor init finds its control socket on.
 pub const LISTEN_FD: i32 = 3;
@@ -34,10 +37,23 @@ pub struct InitConfig {
     /// The berth's root filesystem, an overlay the daemon mounted.
     pub root: PathBuf,
     pub workspace: PathBuf,
-    /// The project's bare mirror, mounted read-only at /berth/repo.git.
-    pub mirror: Option<PathBuf>,
     pub dns: Vec<String>,
     pub tmp_size: String,
+    /// More directories to mount in the berth.
+    #[serde(default)]
+    pub binds: Vec<Bind>,
+    #[serde(default)]
+    pub docker: docker::DockerConfig,
+}
+
+/// A host directory mounted in the berth.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Bind {
+    pub source: PathBuf,
+    /// Where, inside the berth.
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -79,13 +95,23 @@ fn pid1(cfg: InitConfig) -> anyhow::Result<()> {
         libc::dup2(null.as_raw_fd(), 1);
     }
 
+    // From here on, this process and everything it starts are under the
+    // berth's seccomp filter.
+    sys::seccomp::install(&sys::seccomp::program()).context("installing the seccomp filter")?;
+
     let reaper = Reaper::start();
+    let services = Services::default();
+    if let Err(e) = docker::start(&cfg.docker, &reaper) {
+        eprintln!("berth-init: no Docker: {e:#}");
+    }
+    // The control socket is init's alone: nothing it starts may inherit it.
+    sys::cvt(unsafe { libc::fcntl(LISTEN_FD, libc::F_SETFD, libc::FD_CLOEXEC) })?;
     let listener = unsafe { UnixListener::from_raw_fd(LISTEN_FD) };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let reaper = reaper.clone();
+        let (reaper, services) = (reaper.clone(), services.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(conn, reaper) {
+            if let Err(e) = handle(conn, reaper, services) {
                 eprintln!("berth-init: {e:#}");
             }
         });
@@ -93,16 +119,28 @@ fn pid1(cfg: InitConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle(control: UnixStream, reaper: Reaper) -> anyhow::Result<()> {
+fn handle(control: UnixStream, reaper: Reaper, services: Services) -> anyhow::Result<()> {
     let (msg, fd) = sys::recv_with_fd(&control)?;
-    drop(control);
-    let spec: ExecSpec = serde_json::from_slice(&msg)?;
-    let fd = fd.context("no stream attached")?;
-    let stream = UnixStream::from(fd);
-    let frames = Frames::new(stream.try_clone()?);
-    if let Err(e) = exec::run(spec, stream, frames.clone(), reaper) {
-        let _ = frames.send(frames::ERROR, format!("{e:#}").as_bytes());
-        let _ = frames.send(frames::EXIT, &127i32.to_be_bytes());
+    match serde_json::from_slice(&msg)? {
+        InitRequest::Exec(spec) => {
+            drop(control);
+            let stream = UnixStream::from(fd.context("no stream attached")?);
+            let frames = Frames::new(stream.try_clone()?);
+            let result = match spec.service {
+                Some(_) => {
+                    services.start(spec, &reaper).and_then(|pid| Ok(frames.send(frames::STARTED, &pid.to_be_bytes())?))
+                }
+                None => exec::run(spec, stream, frames.clone(), reaper),
+            };
+            if let Err(e) = result {
+                let _ = frames.send(frames::ERROR, format!("{e:#}").as_bytes());
+                let _ = frames.send(frames::EXIT, &127i32.to_be_bytes());
+            }
+        }
+        InitRequest::StopService(name) => {
+            services.stop(&name);
+            (&control).write_all(b"ok\n")?;
+        }
     }
     Ok(())
 }

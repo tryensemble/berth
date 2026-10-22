@@ -25,19 +25,14 @@ pub enum Cmd {
     Daemon,
     /// Pull an OCI image berths can be made from
     Pull { reference: String },
-    /// Add a project's repository, or fetch it again
-    Repo { name: String, url: String },
-    /// Build a layer: run a script as root in a fresh berth and keep what it installed
-    Layer {
-        name: String,
-        /// Shell script to run
-        script: PathBuf,
-        #[arg(long, default_value = "ubuntu:24.04")]
-        image: String,
-        /// Layers to build on top of
-        #[arg(long = "from")]
-        from: Vec<String>,
-    },
+    /// List pulled images
+    Images,
+    /// Projects' repositories, mirrored for their berths
+    #[command(subcommand)]
+    Repo(RepoCmd),
+    /// Layers: what a script installed, shared read-only by the berths made with it
+    #[command(subcommand)]
+    Layer(LayerCmd),
     /// Make a berth; prints its id
     Create {
         #[arg(long)]
@@ -57,8 +52,17 @@ pub enum Cmd {
         pids: u32,
         #[arg(long, default_value = "1G")]
         tmp: String,
+        /// Freeze it after this long unused, like 5m (0: never)
+        #[arg(long)]
+        idle_after: Option<String>,
+        /// Stop it after this long unused, like 12h (0: never)
+        #[arg(long)]
+        stop_after: Option<String>,
+        /// Whose berth it is: one tenant's berths share caches, never more
+        #[arg(long)]
+        tenant: Option<String>,
     },
-    /// Run a command in a berth
+    /// Run a command in a berth, starting the berth if it's idle or stopped
     Exec {
         id: String,
         /// Give it a terminal
@@ -67,7 +71,8 @@ pub enum Cmd {
         /// KEY=VALUE, or KEY to pass this shell's value on (repeatable)
         #[arg(short, long = "env")]
         env: Vec<String>,
-        #[arg(short = 'w', long = "workdir")]
+        /// Directory to run in (/workspace by default)
+        #[arg(short = 'w', long = "dir", visible_alias = "workdir")]
         workdir: Option<String>,
         /// User in the berth (agent by default)
         #[arg(short, long)]
@@ -77,9 +82,33 @@ pub enum Cmd {
         detach: bool,
         #[arg(long)]
         name: Option<String>,
+        /// Run it as a service: kept running, and started again with the berth
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["tty", "detach", "name"])]
+        service: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Show what a detached command or service printed
+    Logs {
+        id: String,
+        name: String,
+        /// Keep printing what it prints
+        #[arg(short, long)]
+        follow: bool,
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: u32,
+    },
+    /// Start berths that are idle or stopped
+    #[command(visible_alias = "wake")]
+    Start { ids: Vec<String> },
+    /// Freeze berths: no CPU, their memory pushed out, back at the next use
+    Idle { ids: Vec<String> },
+    /// Stop berths: nothing runs, their files and services stay
+    Stop { ids: Vec<String> },
+    /// A berth's services
+    #[command(subcommand)]
+    Service(ServiceCmd),
+
     /// List the TCP ports something listens on in a berth
     Ports {
         id: String,
@@ -109,6 +138,47 @@ pub enum Cmd {
     Hold,
 }
 
+#[derive(Subcommand)]
+pub enum RepoCmd {
+    /// Mirror a project's repository, or fetch it again
+    Add { name: String, url: String },
+    /// List mirrored projects
+    Ls,
+    /// Remove a project's mirror
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum LayerCmd {
+    /// Run a script as root in a fresh berth and keep what it installed
+    Build {
+        name: String,
+        /// Shell script to run
+        script: PathBuf,
+        #[arg(long, default_value = "ubuntu:24.04")]
+        image: String,
+        /// Layers to build on top of
+        #[arg(long = "from")]
+        from: Vec<String>,
+    },
+    /// List layers
+    Ls,
+    /// Remove a layer no berth uses
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceCmd {
+    /// List a berth's services
+    Ls {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a service and don't start it again
+    Rm { id: String, name: String },
+}
+
 pub fn main() -> anyhow::Result<i32> {
     run(Cli::parse())
 }
@@ -128,13 +198,25 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             println!("{}", v["rootfs"].as_str().unwrap_or(""));
             Ok(0)
         }
-        Cmd::Repo { name, url } => {
+        Cmd::Images => print_names(&api.json("GET", "/v1/images", None)?),
+        Cmd::Repo(RepoCmd::Add { name, url }) => {
             api.json("POST", "/v1/repos", Some(&json!({ "name": name, "url": url })))?;
             Ok(0)
         }
-        Cmd::Layer { name, script, image, from } => {
+        Cmd::Repo(RepoCmd::Ls) => print_names(&api.json("GET", "/v1/repos", None)?),
+        Cmd::Repo(RepoCmd::Rm { name }) => {
+            api.json("DELETE", &format!("/v1/repos/{name}"), None)?;
+            Ok(0)
+        }
+        Cmd::Layer(LayerCmd::Ls) => print_names(&api.json("GET", "/v1/layers", None)?),
+        Cmd::Layer(LayerCmd::Rm { name }) => {
+            api.json("DELETE", &format!("/v1/layers/{name}"), None)?;
+            Ok(0)
+        }
+        Cmd::Layer(LayerCmd::Build { name, script, image, from }) => {
             let script = std::fs::read_to_string(&script).with_context(|| format!("reading {}", script.display()))?;
-            let b = api.json("POST", "/v1/berths", Some(&json!({ "image": image, "layers": from })))?;
+            let b =
+                api.json("POST", "/v1/berths", Some(&json!({ "image": image, "layers": from, "idle_after": "0" })))?;
             let id = b["id"].as_str().context("no id")?.to_string();
             eprintln!("berth: building layer {name} in berth {id}");
             let spec = ExecSpec {
@@ -153,22 +235,55 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             eprintln!("berth: layer {name} is ready");
             Ok(0)
         }
-        Cmd::Create { project, branch, image, layers, cpus, memory, pids, tmp } => {
+        Cmd::Create { project, branch, image, layers, cpus, memory, pids, tmp, idle_after, stop_after, tenant } => {
             let v = api.json(
                 "POST",
                 "/v1/berths",
                 Some(&json!({
                     "project": project, "branch": branch, "image": image, "layers": layers,
                     "cpus": cpus, "memory": memory, "pids": pids, "tmp": tmp,
+                    "idle_after": idle_after, "stop_after": stop_after, "tenant": tenant,
                 })),
             )?;
             println!("{}", v["id"].as_str().unwrap_or(""));
             Ok(0)
         }
-        Cmd::Exec { id, tty, env, workdir, user, detach, name, cmd } => {
+        Cmd::Exec { id, tty, env, workdir, user, detach, name, service, cmd } => {
             let (rows, cols) = if tty { terminal_size() } else { (0, 0) };
             let env = resolve_env(env, |k| std::env::var(k).ok());
-            exec(&api, &id, ExecSpec { argv: cmd, env, cwd: workdir, user, tty, rows, cols, detach, name })
+            let detach = detach || service.is_some();
+            exec(&api, &id, ExecSpec { argv: cmd, env, cwd: workdir, user, tty, rows, cols, detach, name, service })
+        }
+        Cmd::Logs { id, name, follow, lines } => {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) || name.starts_with('.') {
+                bail!("bad name {name}");
+            }
+            let mut argv = vec!["tail".to_string(), "-n".into(), lines.to_string()];
+            if follow {
+                argv.push("-F".into());
+            }
+            argv.push(format!("/var/log/berth/{name}.log"));
+            exec(&api, &id, ExecSpec { argv, user: Some("root".into()), ..Default::default() })
+        }
+        Cmd::Start { ids } => each(&api, &ids, "start"),
+        Cmd::Idle { ids } => each(&api, &ids, "idle"),
+        Cmd::Stop { ids } => each(&api, &ids, "stop"),
+        Cmd::Service(ServiceCmd::Ls { id, json }) => {
+            let v = api.json("GET", &format!("/v1/berths/{id}/services"), None)?;
+            if json {
+                println!("{v}");
+                return Ok(0);
+            }
+            println!("{:<16} COMMAND", "NAME");
+            for s in v.as_array().into_iter().flatten() {
+                let argv: Vec<&str> = s["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str()).collect();
+                println!("{:<16} {}", s["service"].as_str().unwrap_or(""), argv.join(" "));
+            }
+            Ok(0)
+        }
+        Cmd::Service(ServiceCmd::Rm { id, name }) => {
+            api.json("DELETE", &format!("/v1/berths/{id}/services/{name}"), None)?;
+            Ok(0)
         }
         Cmd::Ports { id, json } => {
             let v = api.json("GET", &format!("/v1/berths/{id}/ports"), None)?;
@@ -221,15 +336,20 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                 println!("{v}");
                 return Ok(0);
             }
-            println!("{:<10} {:<8} {:<14} {:<12} {:<16} LAYERS", "ID", "STATUS", "ADDRESS", "PROJECT", "BRANCH");
+            println!(
+                "{:<10} {:<8} {:>8}  {:<14} {:<12} {:<16} LAYERS",
+                "ID", "STATUS", "MEMORY", "ADDRESS", "PROJECT", "BRANCH"
+            );
             for b in v.as_array().into_iter().flatten() {
                 let s = |k: &str| b[k].as_str().unwrap_or("-").to_string();
                 let layers: Vec<String> =
                     b["layers"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
+                let memory = b["memory"].as_u64().map_or("-".into(), human_size);
                 println!(
-                    "{:<10} {:<8} {:<14} {:<12} {:<16} {}",
+                    "{:<10} {:<8} {:>8}  {:<14} {:<12} {:<16} {}",
                     s("id"),
                     s("status"),
+                    memory,
                     s("ip"),
                     s("project"),
                     s("branch"),
@@ -239,6 +359,33 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn print_names(v: &serde_json::Value) -> anyhow::Result<i32> {
+    for n in v.as_array().into_iter().flatten() {
+        println!("{}", n.as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
+/// Posts action for each berth, printing nothing; stops at the first error.
+fn each(api: &Client, ids: &[String], action: &str) -> anyhow::Result<i32> {
+    for id in ids {
+        api.json("POST", &format!("/v1/berths/{id}/{action}"), None)?;
+    }
+    Ok(0)
+}
+
+/// Bytes the way people read them: 812K, 41M, 3.2G.
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 || v >= 10.0 { format!("{v:.0}{}", UNITS[u]) } else { format!("{v:.1}{}", UNITS[u]) }
 }
 
 fn proxy(api: &Client, id: &str, port: u16) -> anyhow::Result<UnixStream> {
@@ -366,6 +513,22 @@ mod tests {
         let lookup = |k: &str| (k == "API_KEY").then(|| "secret=1".to_string());
         let env = resolve_env(vec!["A=1".into(), "API_KEY".into(), "UNSET".into(), "B=".into()], lookup);
         assert_eq!(env, ["A=1", "API_KEY=secret=1", "B="]);
+    }
+
+    #[test]
+    fn sizes_read_like_people_write_them() {
+        assert_eq!(human_size(512), "512B");
+        assert_eq!(human_size(1536), "1.5K");
+        assert_eq!(human_size(41 << 20), "41M");
+        assert_eq!(human_size((3 << 30) + (1 << 29)), "3.5G");
+    }
+
+    #[test]
+    fn a_service_cant_also_take_a_terminal() {
+        assert!(Cli::try_parse_from(["berth", "exec", "--service", "web", "-t", "ab", "--", "x"]).is_err());
+        let cli = Cli::try_parse_from(["berth", "exec", "--service", "web", "--dir", "/srv", "ab", "--", "x"]).unwrap();
+        let Cmd::Exec { service, workdir, .. } = cli.cmd else { panic!("not exec") };
+        assert_eq!((service.as_deref(), workdir.as_deref()), (Some("web"), Some("/srv")));
     }
 
     #[test]

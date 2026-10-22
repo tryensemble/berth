@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,7 +19,47 @@ use super::reaper::Reaper;
 use crate::api::{ExecSpec, Frames, frames};
 use crate::sys;
 
+/// Runs spec for a caller on stream: attached with pipes or a terminal, or
+/// detached, in which case only its pid is sent.
 pub fn run(spec: ExecSpec, stream: UnixStream, frames: Frames, reaper: Reaper) -> anyhow::Result<()> {
+    if spec.detach {
+        let (child, _) = spawn_detached(&spec, &reaper)?;
+        frames.send(frames::STARTED, &child.id().to_be_bytes())?;
+        return Ok(());
+    }
+    let cmd = command(&spec)?;
+    if spec.tty { run_tty(spec, cmd, stream, frames, reaper) } else { run_pipes(cmd, stream, frames, reaper) }
+}
+
+/// Starts spec in its own session with its output appended to
+/// /var/log/berth/<name>.log.
+pub fn spawn_detached(spec: &ExecSpec, reaper: &Reaper) -> anyhow::Result<(Child, mpsc::Receiver<i32>)> {
+    let name = spec.service.as_deref().or(spec.name.as_deref()).unwrap_or("detached");
+    let (mut cmd, user) = command_for(spec)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(format!("/var/log/berth/{}.log", name.replace('/', "_")))?;
+    unsafe { libc::fchown(log.as_raw_fd(), user.uid, user.gid) };
+    cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    Ok(reaper.spawn(&mut cmd)?)
+}
+
+fn command(spec: &ExecSpec) -> anyhow::Result<Command> {
+    Ok(command_for(spec)?.0)
+}
+
+/// The command spec describes, as its user, in its directory, with the
+/// berth's environment under the caller's.
+fn command_for(spec: &ExecSpec) -> anyhow::Result<(Command, passwd::User)> {
     if spec.argv.is_empty() {
         bail!("no command");
     }
@@ -53,29 +93,20 @@ pub fn run(spec: ExecSpec, stream: UnixStream, frames: Frames, reaper: Reaper) -
     let cwd = spec.cwd.clone().unwrap_or_else(|| {
         if Path::new("/workspace/.git").exists() || user.uid != 0 { "/workspace".into() } else { "/".into() }
     });
-    cmd.current_dir(&cwd).uid(user.uid).gid(user.gid);
+    cmd.current_dir(&cwd);
 
-    if spec.detach {
-        let name = spec.name.clone().unwrap_or_else(|| "detached".into());
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o644)
-            .open(format!("/var/log/berth/{}.log", name.replace('/', "_")))?;
-        unsafe { libc::fchown(log.as_raw_fd(), user.uid, user.gid) };
-        cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        let (child, _) = reaper.spawn(&mut cmd)?;
-        frames.send(frames::STARTED, &child.id().to_be_bytes())?;
-        return Ok(());
+    // std would drop supplementary groups; the agent needs its own (sudo,
+    // docker), so the credentials are set here instead.
+    let (uid, gid, groups) = (user.uid, user.gid, passwd::groups(&user));
+    unsafe {
+        cmd.pre_exec(move || {
+            sys::cvt(libc::setgroups(groups.len(), groups.as_ptr()))?;
+            sys::cvt(libc::setresgid(gid, gid, gid))?;
+            sys::cvt(libc::setresuid(uid, uid, uid))?;
+            Ok(())
+        });
     }
-
-    if spec.tty { run_tty(spec, cmd, stream, frames, reaper) } else { run_pipes(cmd, stream, frames, reaper) }
+    Ok((cmd, user))
 }
 
 fn exit_after(frames: &Frames, rx: mpsc::Receiver<i32>, outputs: mpsc::Receiver<()>, n: usize) -> anyhow::Result<()> {

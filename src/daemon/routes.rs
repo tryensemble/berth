@@ -17,12 +17,32 @@ pub enum Route<'a> {
     Exec(&'a str),
     /// `POST /v1/berths/{id}/proxy`, upgraded to a byte stream to a port
     Proxy(&'a str),
+    /// `POST /v1/berths/{id}/start`
+    Start(&'a str),
+    /// `POST /v1/berths/{id}/idle`
+    Idle(&'a str),
+    /// `POST /v1/berths/{id}/stop`
+    Stop(&'a str),
+    /// `GET /v1/berths/{id}/services`
+    Services(&'a str),
+    /// `DELETE /v1/berths/{id}/services/{name}`
+    RemoveService(&'a str, &'a str),
     /// `POST /v1/images`
     PullImage,
+    /// `GET /v1/images`
+    Images,
     /// `POST /v1/repos`
     AddRepo,
+    /// `GET /v1/repos`
+    Repos,
+    /// `DELETE /v1/repos/{name}`
+    RemoveRepo(&'a str),
     /// `POST /v1/layers`
     CommitLayer,
+    /// `GET /v1/layers`
+    Layers,
+    /// `DELETE /v1/layers/{name}`
+    RemoveLayer(&'a str),
 }
 
 impl<'a> Route<'a> {
@@ -37,9 +57,19 @@ impl<'a> Route<'a> {
             ("GET", ["v1", "berths", id, "ports"]) => Route::Ports(id),
             ("POST", ["v1", "berths", id, "exec"]) if upgrade => Route::Exec(id),
             ("POST", ["v1", "berths", id, "proxy"]) if upgrade => Route::Proxy(id),
+            ("POST", ["v1", "berths", id, "start"]) => Route::Start(id),
+            ("POST", ["v1", "berths", id, "idle"]) => Route::Idle(id),
+            ("POST", ["v1", "berths", id, "stop"]) => Route::Stop(id),
+            ("GET", ["v1", "berths", id, "services"]) => Route::Services(id),
+            ("DELETE", ["v1", "berths", id, "services", name]) => Route::RemoveService(id, name),
             ("POST", ["v1", "images"]) => Route::PullImage,
+            ("GET", ["v1", "images"]) => Route::Images,
             ("POST", ["v1", "repos"]) => Route::AddRepo,
+            ("GET", ["v1", "repos"]) => Route::Repos,
+            ("DELETE", ["v1", "repos", name]) => Route::RemoveRepo(name),
             ("POST", ["v1", "layers"]) => Route::CommitLayer,
+            ("GET", ["v1", "layers"]) => Route::Layers,
+            ("DELETE", ["v1", "layers", name]) => Route::RemoveLayer(name),
             _ => return None,
         })
     }
@@ -57,6 +87,27 @@ mod tests {
         assert_eq!(Route::parse("DELETE", "/v1/berths/ab12", false), Some(Route::Destroy("ab12")));
         assert_eq!(Route::parse("GET", "/v1/berths/ab12/ports", false), Some(Route::Ports("ab12")));
         assert_eq!(Route::parse("GET", "/v1/berths/?all", false), Some(Route::List));
+    }
+
+    #[test]
+    fn lifecycle_and_service_routes() {
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/start", false), Some(Route::Start("ab")));
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/idle", false), Some(Route::Idle("ab")));
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/stop", false), Some(Route::Stop("ab")));
+        assert_eq!(Route::parse("GET", "/v1/berths/ab/services", false), Some(Route::Services("ab")));
+        assert_eq!(
+            Route::parse("DELETE", "/v1/berths/ab/services/web", false),
+            Some(Route::RemoveService("ab", "web"))
+        );
+    }
+
+    #[test]
+    fn store_routes() {
+        assert_eq!(Route::parse("GET", "/v1/images", false), Some(Route::Images));
+        assert_eq!(Route::parse("GET", "/v1/layers", false), Some(Route::Layers));
+        assert_eq!(Route::parse("DELETE", "/v1/layers/tools", false), Some(Route::RemoveLayer("tools")));
+        assert_eq!(Route::parse("GET", "/v1/repos", false), Some(Route::Repos));
+        assert_eq!(Route::parse("DELETE", "/v1/repos/web", false), Some(Route::RemoveRepo("web")));
     }
 
     #[test]

@@ -1,129 +1,11 @@
-//! End to end: the real `berth` against a running `berthd`.
-//!
-//! These need Linux, a daemon (`sudo berthd`), and access to its socket (be in
-//! the `berth` group, or set `BERTH_SOCKET`). They're ignored by default:
-//!
-//! ```sh
-//! cargo test --test e2e -- --ignored
-//! ```
-//!
-//! Each test makes its own berths and removes them when it ends, so they run
-//! in parallel, as berths on a busy machine would.
+//! The prototype's promises: a berth is a machine of its own, and berths
+//! don't meet.
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
 
-/// The layer most tests build on: git, and the agent user.
-const LAYER: &str = "e2e";
-
-fn berth(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_berth")).args(args).output().expect("running berth")
-}
-
-/// Runs berth and returns its stdout, failing the test if it fails.
-fn ok(args: &[&str]) -> String {
-    let out = berth(args);
-    assert!(
-        out.status.success(),
-        "berth {} failed ({}):\n{}{}",
-        args.join(" "),
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Builds the shared test layer once per run.
-fn layer() -> &'static str {
-    static BUILT: OnceLock<()> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let script = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            script.path(),
-            "set -e
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends git >/dev/null
-            userdel -r ubuntu 2>/dev/null || true
-            useradd -m -u 1000 -s /bin/bash agent
-            rm -rf /var/lib/apt/lists/*",
-        )
-        .unwrap();
-        ok(&["layer", LAYER, &script.path().display().to_string()]);
-    });
-    LAYER
-}
-
-/// A berth that's destroyed when the test ends, pass or fail.
-struct Berth(String);
-
-impl Berth {
-    fn new(args: &[&str]) -> Berth {
-        let mut all = vec!["create", "--layer", layer()];
-        all.extend(args);
-        Berth(ok(&all))
-    }
-
-    /// Runs a shell script in the berth as the agent.
-    fn sh(&self, script: &str) -> Output {
-        berth(&["exec", &self.0, "--", "sh", "-c", script])
-    }
-
-    fn sh_ok(&self, script: &str) -> String {
-        ok(&["exec", &self.0, "--", "sh", "-c", script])
-    }
-
-    fn root(&self, script: &str) -> String {
-        ok(&["exec", "-u", "root", &self.0, "--", "sh", "-c", script])
-    }
-
-    fn info(&self) -> serde_json::Value {
-        let all: serde_json::Value = serde_json::from_str(&ok(&["ls", "--json"])).unwrap();
-        all.as_array().unwrap().iter().find(|b| b["id"] == self.0.as_str()).cloned().expect("listed")
-    }
-
-    /// Serves `text` over HTTP on port, bound to addr, in the background.
-    fn serve(&self, addr: &str, port: u16, text: &str) {
-        // perl is in every Ubuntu image; nothing to install.
-        let server = format!(
-            r#"use IO::Socket::INET;
-            my $s = IO::Socket::INET->new(LocalAddr => "{addr}", LocalPort => {port}, Listen => 5, ReuseAddr => 1) or die $!;
-            while (my $c = $s->accept) {{ <$c>; print $c "HTTP/1.0 200 OK\r\n\r\n{text}\n"; close $c }}"#
-        );
-        ok(&["exec", "-d", "--name", "web", &self.0, "--", "perl", "-e", &server]);
-        wait_for(|| self.sh("cat /proc/net/tcp | grep -q ' 0A '").status.success());
-    }
-}
-
-impl Drop for Berth {
-    fn drop(&mut self) {
-        let _ = berth(&["destroy", &self.0]);
-    }
-}
-
-fn wait_for(mut f: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !f() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Fetches / from port through `berth proxy`.
-fn get(id: &str, port: u16) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_berth"))
-        .args(["proxy", id, &port.to_string()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
-    let out = child.wait_with_output().unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or("").to_string()
-}
+use crate::{Berth, berth, get, ok, wait_for};
 
 #[test]
 #[ignore = "needs a running berthd; run with --ignored"]
@@ -254,6 +136,8 @@ fn detached_commands_outlive_their_exec_and_log() {
 #[ignore = "needs a running berthd; run with --ignored"]
 fn projects_are_checked_out_on_their_branch() {
     let repo = tempfile::tempdir().unwrap();
+    // Mirrors are fetched as an unprivileged id: the repository must be readable.
+    std::fs::set_permissions(repo.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let git = |args: &[&str]| {
         let st = Command::new("git").args(args).current_dir(repo.path()).status().unwrap();
         assert!(st.success(), "git {args:?}");
@@ -264,13 +148,17 @@ fn projects_are_checked_out_on_their_branch() {
     git(&["-c", "user.name=e2e", "-c", "user.email=e2e@example.com", "commit", "-qm", "init"]);
 
     let project = format!("e2e-{}", std::process::id());
-    ok(&["repo", &project, &repo.path().display().to_string()]);
+    ok(&["repo", "add", &project, &repo.path().display().to_string()]);
     let b = Berth::new(&["--project", &project, "--branch", "thread-1"]);
     assert_eq!(b.sh_ok("git branch --show-current; cat README"), "thread-1\ne2e");
     // The shared mirror can't be written from the berth.
     assert!(!b.sh("touch /berth/repo.git/HEAD").status.success());
     assert_eq!(b.sh_ok("git remote get-url origin"), repo.path().display().to_string());
     b.sh_ok("git -c user.name=a -c user.email=a@b commit -q --allow-empty -m mine");
+    // The mirror can't go while a berth uses it.
+    assert!(!berth(&["repo", "rm", &project]).status.success());
+    drop(b);
+    ok(&["repo", "rm", &project]);
 }
 
 #[test]
@@ -291,6 +179,6 @@ fn destroyed_berths_are_gone() {
 fn bad_requests_are_refused() {
     let out = berth(&["create", "--layer", "no-such-layer"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("no layer no-such-layer"));
-    let out = berth(&["repo", "../escape", "/tmp"]);
+    let out = berth(&["repo", "add", "../escape", "/tmp"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("bad project name"));
 }

@@ -22,13 +22,27 @@ pub fn rootfs(images: &Path, reference: &str) -> PathBuf {
 }
 
 /// Pulls reference into `images/<key>/rootfs`, unless it's there already.
+///
+/// Unpacking runs as root over what a registry sent, so it runs in a thread
+/// that may write only into that image's directory.
 pub fn pull(images: &Path, reference: &str) -> anyhow::Result<PathBuf> {
+    // One pull at a time: two of the same image would share a directory.
+    static PULLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = PULLING.lock().unwrap_or_else(|e| e.into_inner());
     let r = Reference::parse(reference);
     let dir = images.join(r.key());
     let root = dir.join("rootfs");
     if root.exists() {
         return Ok(root);
     }
+    fs::create_dir_all(&dir)?;
+    let reference = reference.to_string();
+    let target = dir.clone();
+    crate::sys::landlock::confined(&[&dir], move || pull_into(&target, &r, &reference))
+}
+
+fn pull_into(dir: &Path, r: &Reference, reference: &str) -> anyhow::Result<PathBuf> {
+    let root = dir.join("rootfs");
     let mut reg = Registry::default();
     let base = format!("https://{}/v2/{}", r.host(), r.repo);
 

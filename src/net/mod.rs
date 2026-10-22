@@ -58,6 +58,10 @@ pub fn setup_host() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Berths per machine: addresses come from 10.200.0.0/16, and each berth's
+/// 65536 ids must fit below 2^32.
+pub const MAX_BERTHS: u32 = 65_000;
+
 pub fn address(n: u32) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(Ipv4Addr::new(10, 200, 0, 0)) + n)
 }

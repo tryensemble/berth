@@ -41,11 +41,33 @@ pub struct ExecSpec {
     #[serde(default)]
     pub detach: bool,
     pub name: Option<String>,
+    /// Run it as a service of this name: detached, restarted when it exits,
+    /// and started again whenever the berth starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+/// What the daemon asks of a berth's init over its control socket.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InitRequest {
+    /// Run a command, speaking frames on the stream sent along.
+    Exec(ExecSpec),
+    /// Stop a service and don't start it again.
+    StopService(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_requests_are_tagged() {
+        let r = InitRequest::StopService("web".into());
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"stop_service":"web"}"#);
+        let back: InitRequest = serde_json::from_str(r#"{"exec":{"argv":["ls"]}}"#).unwrap();
+        assert_eq!(back, InitRequest::Exec(ExecSpec { argv: vec!["ls".into()], ..Default::default() }));
+    }
 
     #[test]
     fn exec_spec_fills_in_defaults() {

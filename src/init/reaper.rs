@@ -15,15 +15,23 @@ impl Reaper {
         let map = r.0.clone();
         std::thread::spawn(move || {
             loop {
-                let mut status = 0;
-                let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-                if pid < 0 {
+                // Look without reaping first: a child whose exec failed is
+                // reaped by spawn itself, under the table's lock.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let r = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
+                if r < 0 {
                     std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                let pid = unsafe { info.si_pid() };
+                let mut map = map.lock().unwrap();
+                let mut status = 0;
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
                     continue;
                 }
                 let code =
                     if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-                if let Some(tx) = map.lock().unwrap().remove(&pid) {
+                if let Some(tx) = map.remove(&pid) {
                     let _ = tx.send(code);
                 }
             }
