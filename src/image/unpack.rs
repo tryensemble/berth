@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Unpacks a layer tarball over root. `.wh.<name>` removes name from the
 /// layers below; `.wh..wh..opq` empties its directory first.
@@ -18,14 +18,14 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
         let path = entry.path()?.into_owned();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if let Some(hidden) = name.strip_prefix(".wh.") {
-            let parent = root.join(path.parent().unwrap_or(Path::new("")));
+            // Whiteouts are removals: keep them from reaching outside root,
+            // through `..` or a symlink an earlier layer left on the way.
+            let Some(parent) = dir_inside(root, path.parent().unwrap_or(Path::new(""))) else { continue };
             if hidden == ".wh..opq" {
-                if let Ok(rd) = fs::read_dir(&parent) {
-                    for e in rd.flatten() {
-                        remove_any(&e.path())?;
-                    }
+                for e in fs::read_dir(&parent)?.flatten() {
+                    remove_any(&e.path())?;
                 }
-            } else {
+            } else if !matches!(hidden, "" | "." | "..") {
                 remove_any(&parent.join(hidden))?;
             }
             continue;
@@ -33,6 +33,15 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
         entry.unpack_in(root)?;
     }
     Ok(())
+}
+
+/// root/rel with its symlinks resolved, if that's a directory inside root.
+fn dir_inside(root: &Path, rel: &Path) -> Option<PathBuf> {
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return None;
+    }
+    let dir = fs::canonicalize(root.join(rel)).ok()?;
+    (dir.starts_with(fs::canonicalize(root).ok()?) && dir.is_dir()).then_some(dir)
 }
 
 fn remove_any(p: &Path) -> io::Result<()> {
@@ -46,7 +55,7 @@ fn remove_any(p: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Seek;
+    use std::io::{Seek, Write};
 
     enum E<'a> {
         Dir(&'a str),
@@ -123,5 +132,60 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         unpack_layer(f, root.path(), true).unwrap();
         assert_eq!(fs::read_to_string(root.path().join("hello")).unwrap(), "world");
+    }
+
+    /// A raw tar entry, bypassing the builder's own path checks.
+    fn raw_entry(name: &[u8]) -> File {
+        let mut h = header();
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+        h.set_mode(0o644);
+        h.set_size(1);
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&h, &b"x"[..]).unwrap();
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&b.into_inner().unwrap()).unwrap();
+        f.rewind().unwrap();
+        f
+    }
+
+    #[test]
+    fn entries_and_whiteouts_stay_inside_the_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(outer.path().join("victim"), "keep me").unwrap();
+
+        let _ = unpack_layer(raw_entry(b"../escaped"), &root, false);
+        assert!(!outer.path().join("escaped").exists());
+
+        unpack_layer(raw_entry(b"../.wh.victim"), &root, false).unwrap();
+        unpack_layer(raw_entry(b"sub/.wh.."), &root, false).unwrap();
+        assert!(outer.path().join("victim").exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn whiteouts_dont_follow_symlinks_out() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(outer.path().join("host")).unwrap();
+        fs::write(outer.path().join("host/passwd"), "keep me").unwrap();
+        // An earlier layer left a link out of the image.
+        std::os::unix::fs::symlink(outer.path().join("host"), root.join("x")).unwrap();
+
+        unpack_layer(raw_entry(b"x/.wh.passwd"), &root, false).unwrap();
+        unpack_layer(raw_entry(b"x/.wh..wh..opq"), &root, false).unwrap();
+        assert!(outer.path().join("host/passwd").exists());
+    }
+
+    #[test]
+    fn dot_slash_whiteouts_still_apply() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        unpack_layer(layer(&[E::Dir("etc"), E::File("etc/drop", b"1")]), r, false).unwrap();
+        unpack_layer(raw_entry(b"./etc/.wh.drop"), r, false).unwrap();
+        assert!(!r.join("etc/drop").exists());
     }
 }
