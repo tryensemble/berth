@@ -12,13 +12,22 @@ Report it privately through
 not in a public issue. Include what you ran and what you reached. We'll reply
 within a few working days.
 
-## Status
+## What berth defends, and what it doesn't
 
-berth is a prototype. These are known and planned, not bugs to report:
+Each berth has its own user, mount, PID, network, IPC, UTS and cgroup
+namespaces, and a root that's an unused uid range on the host. A seccomp filter
+refuses the kernel's riskiest calls, and `/proc` and `/sys` hide the host.
+Berths can't reach each other, the host, private networks or cloud metadata.
+The daemon never runs git or unpacks images as unconfined root. The
+end-to-end tests in [tests/e2e](tests/e2e) try these walls from inside a berth.
 
-- There's no seccomp allowlist or Landlock policy yet (milestone 2). Berths
-  rely on namespaces, an unprivileged user namespace, cgroups and the network
-  rules alone.
+Known limits, which aren't bugs to report:
+
 - Berths share the host's kernel. A kernel bug reachable from inside a berth
-  can break the wall. Strict mode (gVisor) is planned for code nobody vouches
-  for.
+  can break the wall. Keep the kernel patched. Strict mode (gVisor) is for
+  code nobody vouches for.
+- Members of the `berth` group control every berth on the machine; the group
+  is for operators, not for the agents.
+- A berth can use its share of the machine (CPU, memory, processes, as
+  limited) and the network to the internet. It can't take more, but it can
+  use what it has for anything.

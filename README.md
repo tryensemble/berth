@@ -24,12 +24,11 @@ $ berth exec -t 6ae0756e -- claude                     # an agent, in the same b
 $ berth forward 6ae0756e 3000                          # http://127.0.0.1:3000 on this machine
 ```
 
-> [!WARNING]
-> berth is an early prototype. The core works: namespaces, an
-> unprivileged root, overlay filesystems, cgroup limits and an isolated
-> network. The hardening that the [architecture](docs/ARCHITECTURE.md) calls
-> for (a seccomp allowlist, Landlock) isn't in yet. Don't run untrusted code in
-> it on a machine you care about.
+> [!NOTE]
+> berth is young: its walls are tested from the inside (see
+> [tests/e2e](tests/e2e)), but it hasn't had an outside security review yet.
+> Berths share the machine's kernel; [SECURITY.md](SECURITY.md) says what that
+> means.
 
 ## Contents
 
@@ -68,8 +67,12 @@ machines.
 | **Its own files** | A read-only base image plus shared layers, with a private writable overlay on top. Writes never reach other berths. |
 | **Its own checkout** | A clone of the project on its own branch. It shares the objects of a read-only mirror, so a new checkout costs almost nothing. |
 | **Its own network** | Its own loopback and ports, and the internet through NAT. The host, other berths, private networks and cloud metadata are blocked. |
-| **Limits** | A cgroup per berth for CPU, memory, processes and `/tmp` size. |
-| **Long-running work** | Detached commands are children of the berth's init, not of the daemon: they keep running when the daemon restarts. |
+| **Limits** | A cgroup per berth for CPU, memory, processes and `/tmp` size, delegated to it: it can arrange its own processes (Docker does) but never raise its limits. |
+| **A smaller kernel** | A seccomp filter refuses the kernel's riskiest calls (BPF, io_uring, module loading, the keyring, ...), and `/proc` and `/sys` hide the host. |
+| **Rest when unused** | A berth nobody uses is frozen and its memory pushed out: no CPU, about a megabyte. Any use wakes it in milliseconds, with its programs where they were. After a long time unused it's stopped; it starts again in a fraction of a second. |
+| **Services** | Commands started with `--service` are kept running and started again whenever the berth starts. |
+| **Docker** | Each berth can run its own Docker (its own layer), started on first use. Containers count against the berth's limits, serve on the berth's ports, and no other berth sees them. |
+| **Long-running work** | Everything in a berth is a child of its init, not of the daemon: it keeps running when the daemon restarts or is upgraded. |
 
 ## Requirements
 
@@ -95,40 +98,60 @@ sudo systemctl enable --now berthd
 berth pull ubuntu:24.04
 
 # A shared layer with git, Node and Claude Code, built once for every berth.
-berth layer tools layers/tools.sh
+berth layer build tools layers/tools.sh
+# And Docker, for berths that run containers (started on first use in a berth).
+berth layer build docker layers/docker.sh --from tools
 
 # A project, mirrored once; each berth gets its own branch of it.
-berth repo web https://github.com/you/web
+berth repo add web https://github.com/you/web
 
 a=$(berth create --project web --branch thread-a --layer tools)
 b=$(berth create --project web --branch thread-b --layer tools)
 
 # Both serve :3000. Neither knows about the other.
-berth exec -d --name dev "$a" -- npm run dev
-berth exec -d --name dev "$b" -- npm run dev
+berth exec --service dev "$a" -- npm run dev
+berth exec --service dev "$b" -- npm run dev
+berth logs "$a" dev
 berth ports "$a"                       # 3000
 berth forward "$b" 3000 --local 3001   # b's :3000 at http://127.0.0.1:3001
 
 # Run an agent inside a berth.
 berth exec -t -e ANTHROPIC_API_KEY "$a" -- claude
 
+# Unused berths go idle on their own (--idle-after, 5m by default); this does it now.
+berth idle "$b"
+berth ls                               # b: idle, ~1M of memory
+berth ports "$b"; berth exec "$b" -- true   # any use wakes it
+
 berth destroy "$a" "$b"
+```
+
+Idle berths' memory goes to swap, so give the machine some. With zswap in
+front, it's compressed in memory before it reaches the disk:
+
+```sh
+sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo 1 | sudo tee /sys/module/zswap/parameters/enabled
 ```
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `berth pull REF` | Pull an OCI image, such as `ubuntu:24.04`, to make berths from |
-| `berth layer NAME SCRIPT` | Run a script as root in a fresh berth and keep what it installed as a shared, read-only layer |
-| `berth repo NAME URL` | Mirror a project's repository, or fetch it again |
-| `berth create` | Make a berth and print its id (`--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`) |
-| `berth exec ID -- CMD` | Run a command in a berth (`-t` terminal, `-d` detach, `-u` user, `-e` env, `-w` dir) |
-| `berth ports ID` | List the TCP ports something listens on in a berth |
+| `berth create` | Make a berth and print its id (`--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`, `--idle-after`, `--stop-after`, `--tenant`) |
+| `berth exec ID -- CMD` | Run a command in a berth, waking it if needed (`-t` terminal, `-d` detach, `--service NAME`, `-u` user, `-e` env, `--dir`) |
+| `berth logs ID NAME` | What a detached command or service printed (`-f` to follow) |
+| `berth service ls\|rm ID` | A berth's services |
+| `berth ports ID` | The TCP ports something listens on in a berth |
 | `berth proxy ID PORT` | Connect stdin and stdout to a port in a berth, for use as an SSH `ProxyCommand` and the like |
 | `berth forward ID PORT` | Serve a berth's port on this machine's `127.0.0.1` |
-| `berth ls` | List berths (`--json` for scripts) |
+| `berth idle\|stop\|start ID...` | Freeze berths, stop them, or start them again |
+| `berth ls` | List berths with their state and memory (`--json` for scripts) |
 | `berth destroy ID...` | Remove berths and everything in them |
+| `berth pull REF` / `berth images` | Pull an OCI image, such as `ubuntu:24.04`, to make berths from |
+| `berth layer build\|ls\|rm` | Run a script as root in a fresh berth and keep what it installed as a shared, read-only layer |
+| `berth repo add\|ls\|rm` | Mirror a project's repository, or fetch it again |
 
 Every command talks to the daemon at `/run/berth/berth.sock`. Set
 `BERTH_SOCKET` to use another socket.
@@ -170,12 +193,17 @@ the connection to a stream with `Upgrade`, as Docker's API does.
 | `POST` | `/v1/berths` | Create a berth |
 | `GET` | `/v1/berths/{id}` | One berth |
 | `DELETE` | `/v1/berths/{id}` | Destroy a berth |
+| `POST` | `/v1/berths/{id}/start`, `/idle`, `/stop` | Change its state |
 | `GET` | `/v1/berths/{id}/ports` | Listening ports |
 | `POST` | `/v1/berths/{id}/exec` | Run a command (upgrade; framed stdin, stdout, stderr, exit code) |
 | `POST` | `/v1/berths/{id}/proxy` | A byte stream to a port (upgrade) |
-| `POST` | `/v1/images` | Pull an image |
-| `POST` | `/v1/repos` | Mirror a repository |
-| `POST` | `/v1/layers` | Keep a berth's changes as a layer |
+| `GET` | `/v1/berths/{id}/services` | Its services |
+| `DELETE` | `/v1/berths/{id}/services/{name}` | Stop and forget a service |
+| `GET`, `POST` | `/v1/images` | List, or pull, images |
+| `GET`, `POST` | `/v1/repos` | List, or mirror, repositories |
+| `DELETE` | `/v1/repos/{name}` | Remove a mirror no berth uses |
+| `GET`, `POST` | `/v1/layers` | List layers, or keep a berth's changes as one |
+| `DELETE` | `/v1/layers/{name}` | Remove a layer no berth uses |
 
 An exec stream is a series of frames: a type byte, a big-endian `u32` length,
 then the data (see [`src/api/frames.rs`](src/api/frames.rs)).
@@ -206,8 +234,8 @@ src/
 └── pipe.rs        joining two byte streams
 tests/
 ├── cli.rs         the binary without a daemon
-└── e2e.rs         the binary against a running daemon
-layers/tools.sh    the tools layer: git, Node, Claude Code, the agent user
+└── e2e/           the binary against a running daemon: basics, hardening, lifecycle
+layers/             shared layers: tools (git, Node, Claude Code), docker
 dist/              the systemd unit
 docs/              architecture
 ```
@@ -218,10 +246,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
 
 1. **Prototype** ✅ create, exec (terminal and detached), ports, proxy,
    destroy; images, layers and project checkouts; isolated networking.
-2. Hardening: a seccomp allowlist and Landlock. Idle, stop and wake.
-   Services that restart when a berth wakes.
-3. Docker inside a berth, a registry mirror, shared caches, reflinked
-   checkouts.
+2. **Hardening** ✅ seccomp, masked `/proc`, delegated cgroups, link-safe
+   setup, Landlock around the daemon's root work. Idle, stop and wake.
+   Services.
+3. **Docker inside a berth** ✅ its own dockerd, started on first use,
+   containers in the berth's cgroup and network. A registry mirror, shared
+   caches and reflinked checkouts are still to come.
 4. Snapshots and forks, and an [Ensemble](https://github.com/tryensemble)
    driver.
 5. Strict mode: berths under gVisor, for code nobody vouches for.

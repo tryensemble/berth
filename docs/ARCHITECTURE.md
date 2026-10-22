@@ -41,8 +41,9 @@ that's reachable from inside. Virtual machines rule that out, at the cost of a
 kernel and reserved memory per machine, which is what we're getting away from.
 berth's answer, in order:
 
-1. Make the reachable kernel small: a strict seccomp allowlist, no real root,
-   no host devices, no kernel modules, no BPF.
+1. Make the reachable kernel small: a seccomp filter that refuses the
+   kernel's riskiest calls, no real root, no host devices, no kernel modules,
+   no BPF, no io_uring.
 2. Keep the computer's kernel patched (Ubuntu's livepatch where available).
 3. A **strict** mode per berth for when that isn't enough: the same berth, run
    under gVisor, a user-space kernel that sits between the berth's programs and
@@ -97,15 +98,36 @@ from youki's crates and Codex's Linux sandbox:
 
 - **Namespaces**: user, mount, PID, network, IPC, UTS and cgroup.
 - **cgroup v2**, one per berth, delegated to the berth so Docker's containers
-  count against it: `cpu.max`, `cpu.weight`, `memory.max`, `memory.high`,
-  `pids.max`, `io.max`. Freezing a berth is `cgroup.freeze`, killing it
-  `cgroup.kill`.
-- **seccomp**: an allowlist close to Docker's default profile, widened just
-  enough for Docker-in-a-berth (mount, unshare, setns, namespaced clone), with
-  the dangerous calls (kexec, module loading, BPF, `userfaultfd`,
-  `perf_event_open`, keyctl, ...) refused.
-- **Landlock** as a second line: even if a mount were set up wrongly, init and
-  everything it starts can only write inside the berth's own paths.
+  count against it: `cpu.max`, `memory.max`, `pids.max`. The berth owns its
+  cgroup's directory and process lists, not its limit files: it can arrange
+  its processes below its limits, never raise them. Freezing a berth is
+  `cgroup.freeze`, killing it `cgroup.kill`.
+- **seccomp**: init puts itself and everything it starts under a filter that
+  refuses the calls a berth has no use for and that reach the most kernel
+  code: module and kernel loading, BPF, `perf_event_open`, io_uring,
+  `userfaultfd`, the keyring, file handles, clock, swap and quota changes,
+  x32 and other architectures' calls. It's a denylist, not Docker's
+  allowlist, on purpose: a berth's root must be able to run Docker and nested
+  sandboxes (mount, unshare, setns, namespaced clone), which is most of what
+  an allowlist would remove; what's left beyond the denylist is guarded by
+  the user namespace. The filter is classic BPF built by berth itself, so the
+  binary stays static.
+- **Masked /proc and /sys**: `kcore`, `keys`, `kallsyms`, `timer_list`,
+  `sched_debug` and `sysrq-trigger` read as empty, `/sys/firmware` and
+  `/sys/kernel/security` are empty, and `/proc/sys` is read-only except the
+  berth's own network's tunables.
+- **No links followed**: a stopped berth's files are its own, so when init
+  builds its root again, and when the daemon makes a layer of it, every path
+  inside is walked without following links, and mount points the berth
+  replaced with links are made directories again.
+- **Landlock** confines what the daemon does as root with what strangers
+  made: unpacking an image runs in a thread that may write only into that
+  image's directory, and git fetches into a mirror only. It isn't applied to
+  berths themselves: a Landlock domain can't mount, and Docker in a berth
+  must, while inside the berth there's nothing but the berth to protect.
+- **The daemon never runs strangers' code or parsers as host root**: git
+  fetches run as an id of their own that owns only the mirrors, and only over
+  git's ordinary transports.
 - **Capabilities** are those of root in a user namespace, which don't apply to
   anything the berth doesn't own.
 
@@ -139,7 +161,7 @@ A berth only ever takes disk for **what it changed**.
 - **Base image**: any OCI image, pulled and unpacked by the daemon itself (no
   Docker needed), Ubuntu 24.04 by default.
 - **Tools layer**: built by running installs in a builder berth and keeping its
-  upper directory as a read-only layer (`berth tools build`). Layers are
+  upper directory as a read-only layer (`berth layer build`). Layers are
   versioned; a berth keeps the versions it was created with until it's moved
   to newer ones.
 - **The berth's own layer** takes `apt install`, `npm -g`, `mise install` and
@@ -218,9 +240,11 @@ secrets proxy without berth knowing about secrets. Transparent interception
 ## Docker inside a berth
 
 Every berth can run Docker, its own and visible to it only. `dockerd` comes
-from the tools layer and is started by init the first time something connects
-to `/var/run/docker.sock` in the berth, so berths that never use Docker never
-pay for it.
+from a Docker layer (`layers/docker.sh`) and is started by init the first time
+something connects to `/run/docker.sock` in the berth, by socket activation
+(init holds the listening socket and hands it to `dockerd -H fd://`), so
+berths that never use Docker never pay for it, and the first connection is
+served.
 
 - It runs as root of the berth's user namespace, with the `overlay2` driver
   (native overlayfs in user namespaces, kernel 5.11 and up; Ubuntu 24.04 has
@@ -267,8 +291,12 @@ from how long a berth has been idle (and changeable by the caller):
 - **Services** are processes started with `exec --service <name>` (the dev
   server, say) plus Docker containers with a restart policy; they're what comes
   back after a stop.
-- This needs swap on the computer: the daemon sets up zswap (compressed, in
-  memory) in front of a swap file on local disk if the computer has none.
+- Idle berths' memory goes to swap, so the computer needs some, ideally with
+  zswap (compressed, in memory) in front of a swap file on local disk. The
+  daemon warns when there's none; setting it up is the operator's, since swap
+  is the whole machine's. Running berths may not swap: a berth over its memory
+  limit fails at once instead of crawling. Swap is allowed while it's idle,
+  up to its memory limit, and its pages come back as they're touched.
 
 Programs are not saved to disk mid-run (CRIU): it's fragile with Docker,
 networking and terminals, and idle plus services gives the same result
@@ -288,7 +316,7 @@ and later:
 | Limit | Default |
 |---|---|
 | CPU | 2 CPUs (`cpu.max`), equal weight |
-| Memory | 4 GB hard (`memory.max`), squeezed above 3 GB (`memory.high`) |
+| Memory | 4 GB hard (`memory.max`); no swap while running |
 | Processes | 4096 |
 | Disk | 20 GB of changes (layer + checkout + Docker data) |
 | `/tmp` | 1 GB |
@@ -314,7 +342,7 @@ berth idle | stop | wake  ID
 berth snapshot ID [NAME]       berth restore ID NAME      berth fork ID|SNAPSHOT
 berth destroy  ID
 berth ls       [--tenant T] [--json]
-berth repo add P URL           berth tools build ...      berth cache promote ...
+berth repo add P URL           berth layer build ...      berth cache promote ...
 ```
 
 `--tenant` groups berths for shared caches and registry mirrors; berths are
