@@ -429,7 +429,7 @@ impl Daemon {
             let url = sys::run("git", &["--git-dir", &mirror.display().to_string(), "config", "--get", "remote.origin.url"])
                 .unwrap_or_default();
             let script = "set -e
-git -c safe.directory='*' clone -q --shared /berth/repo.git /workspace
+git -c safe.directory='*' clone -q --shared -u \"git -c safe.directory='*' upload-pack\" /berth/repo.git /workspace
 cd /workspace
 if [ -n \"$1\" ]; then git checkout -q \"$1\" 2>/dev/null || git checkout -q -b \"$1\"; fi
 if [ -n \"$2\" ]; then git remote set-url origin \"$2\"; fi";
