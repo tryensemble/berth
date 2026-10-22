@@ -1,39 +1,29 @@
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// Reaps every child (PID 1 inherits orphans) and hands exit codes to whoever
-/// waits for that pid.
+/// waits for that pid. SIGCHLD arrives on a signalfd, so there's no polling
+/// and a command that exits is reaped at once.
 #[derive(Clone)]
 pub struct Reaper(Arc<Mutex<HashMap<i32, mpsc::Sender<i32>>>>);
 
 impl Reaper {
     pub fn start() -> Self {
         let r = Reaper(Arc::new(Mutex::new(HashMap::new())));
+        let fd = block_sigchld();
         let map = r.0.clone();
         std::thread::spawn(move || {
+            let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
             loop {
-                // Look without reaping first: a child whose exec failed is
-                // reaped by spawn itself, under the table's lock.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let r = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
-                if r < 0 {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
+                // Blocks until a child's state changes.
+                let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return;
                 }
-                let pid = unsafe { info.si_pid() };
-                let mut map = map.lock().unwrap();
-                let mut status = 0;
-                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
-                    continue;
-                }
-                let code =
-                    if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-                if let Some(tx) = map.remove(&pid) {
-                    let _ = tx.send(code);
-                }
+                reap(&map);
             }
         });
         r
@@ -47,5 +37,36 @@ impl Reaper {
         let (tx, rx) = mpsc::channel();
         map.insert(child.id() as i32, tx);
         Ok((child, rx))
+    }
+}
+
+/// Reaps every child that's ready and delivers its code. Holds the table, so a
+/// spawn in progress finishes registering first.
+fn reap(map: &Mutex<HashMap<i32, mpsc::Sender<i32>>>) {
+    let mut map = map.lock().unwrap();
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            return;
+        }
+        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
+        if let Some(tx) = map.remove(&pid) {
+            let _ = tx.send(code);
+        }
+    }
+}
+
+/// Blocks SIGCHLD in this thread (new threads inherit the mask) and returns a
+/// signalfd it's delivered on instead.
+fn block_sigchld() -> OwnedFd {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC);
+        assert!(fd >= 0, "signalfd: {}", std::io::Error::last_os_error());
+        OwnedFd::from_raw_fd(fd)
     }
 }
