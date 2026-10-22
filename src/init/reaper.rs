@@ -20,8 +20,17 @@ impl Reaper {
             loop {
                 // Blocks until a child's state changes.
                 let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                    return;
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    // Don't let the reaper die, or zombies would pile up; a
+                    // short pause keeps an unexpected persistent error from
+                    // spinning. reap() below still runs, in case a child is
+                    // waiting.
+                    eprintln!("berth-init: reaper read: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 reap(&map);
             }

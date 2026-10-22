@@ -254,7 +254,9 @@ served.
 - Its networks live in the berth's network namespace: a compose service
   publishing `5432` shows up in `ports(id)` and is reachable through `proxy`
   like any other port, and two berths' Postgres never meet.
-- Pulls go through the registry mirror.
+- Pulls go through the registry mirror (designed; the tenant hook isn't wired
+  into the daemon yet, so today each berth's Docker pulls straight from the
+  registry).
 
 Docker is the part of a berth that reaches the most kernel surface (mounts,
 namespaces, netfilter). Strict mode runs it under gVisor with the rest of the

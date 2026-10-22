@@ -133,8 +133,10 @@ impl Daemon {
         // init unshares its mount namespace, so init never reads the
         // root-only repos directory. The mount is carried into the berth.
         if let Some(mirror) = self.mirror_of(b) {
-            let repo = d.join("root/berth/repo.git");
-            fs::create_dir_all(&repo)?;
+            // Resolve the mountpoint without following any link the berth's
+            // own root might hold there (an untrusted base image could ship a
+            // /berth symlink); then the mount can't land outside the berth.
+            let repo = sys::beneath::ensure_dir(&d.join("root"), std::path::Path::new("berth/repo.git"), true)?;
             sys::mount(Some(&mirror.display().to_string()), &repo, None, libc::MS_BIND, None)?;
             sys::mount(None, &repo, None, libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, None)?;
         }
@@ -227,7 +229,9 @@ impl Daemon {
         }
         cgroup::remove(&b.cgroup());
         net::detach(b.n);
-        let _ = sys::umount(&b.dir().join("root/berth/repo.git"), libc::MNT_DETACH);
+        if let Ok(Some(repo)) = sys::beneath::dir(&b.dir().join("root"), std::path::Path::new("berth/repo.git")) {
+            let _ = sys::umount(&repo, libc::MNT_DETACH);
+        }
         let _ = sys::umount(&b.dir().join("root"), libc::MNT_DETACH);
         let _ = fs::remove_dir_all(b.run_dir());
         Ok(())
