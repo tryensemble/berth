@@ -1,6 +1,7 @@
 # berth
 
 [![CI](https://github.com/tryensemble/berth/actions/workflows/ci.yml/badge.svg)](https://github.com/tryensemble/berth/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Light, isolated boxes for AI agent threads on one Linux machine.**
 
@@ -42,6 +43,7 @@ $ berth forward 6ae0756e 3000                          # http://127.0.0.1:3000 o
 - [API](#api)
 - [Development](#development)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ## Why
 
@@ -223,3 +225,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
 4. Snapshots and forks, and an [Ensemble](https://github.com/tryensemble)
    driver.
 5. Strict mode: berths under gVisor, for code nobody vouches for.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option. Unless you explicitly state
+otherwise, any contribution you submit for inclusion in berth shall be dual
+licensed as above, without any additional terms or conditions.
