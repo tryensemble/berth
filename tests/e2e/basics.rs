@@ -15,7 +15,7 @@ fn a_berth_is_its_own_machine() {
     assert_eq!(b.sh_ok("id -un; pwd"), "agent\n/workspace");
     assert_eq!(b.root("id -u"), "0");
     // Its init is PID 1, and nothing from the host is in sight.
-    assert_eq!(b.sh_ok("cat /proc/1/cmdline | tr '\\0' ' '"), "/usr/local/bin/berth __init");
+    assert_eq!(b.sh_ok("cat /proc/1/cmdline | tr '\\0' ' '"), "berth-init __init");
     let procs: usize = b.sh_ok("ls /proc | grep -c '^[0-9]'").parse().unwrap();
     assert!(procs < 10, "{procs} processes visible");
 }

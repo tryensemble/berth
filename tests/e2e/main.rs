@@ -12,6 +12,7 @@
 
 mod basics;
 mod docker;
+mod ensemble;
 mod hardening;
 mod lifecycle;
 mod ports;

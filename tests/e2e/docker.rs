@@ -60,3 +60,28 @@ fn docker_containers_come_back_after_a_stop() {
     ok(&["start", &b.0]);
     wait_up_to(SLOW, || get(&b.0, 5000) == "alive");
 }
+
+#[test]
+#[ignore = "needs a running berthd with the e2e-docker layer; run with --ignored"]
+fn docker_pulls_go_through_the_tenants_own_mirror() {
+    let tenant = format!("e2e-t{}", std::process::id());
+    let ours =
+        Berth::new_with_layers(&[crate::layer(), crate::docker_layer()], &["--memory", "3G", "--tenant", &tenant]);
+    let theirs = docker_berth();
+    let mirror_of = |b: &Berth| b.info()["registry"].as_u64().expect("a Docker berth has a registry mirror");
+    let (our_port, their_port) = (mirror_of(&ours), mirror_of(&theirs));
+    assert_ne!(our_port, their_port, "two tenants share a mirror");
+    assert!(ours.sh_ok("docker info 2>/dev/null").contains(&format!("http://10.200.0.1:{our_port}/")));
+    // A berth reaches its own tenant's mirror and not another's.
+    let reach =
+        |b: &Berth, port: u64| b.sh(&format!("timeout 3 bash -c 'echo > /dev/tcp/10.200.0.1/{port}'")).status.success();
+    assert!(reach(&ours, our_port));
+    assert!(!reach(&ours, their_port), "a berth reached another tenant's mirror");
+    // And its pulls go through it.
+    ours.sh_ok("docker pull -q busybox >/dev/null");
+    let mirror = ok(&["ls", "--json"]);
+    assert!(mirror.contains(&format!("berth-registry-{tenant}")));
+    // The tenant's mirror goes when we're done; it's made again when needed.
+    drop(ours);
+    let _ = crate::berth(&["destroy", &format!("berth-registry-{tenant}")]);
+}
