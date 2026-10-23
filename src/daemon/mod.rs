@@ -233,6 +233,11 @@ impl Daemon {
             }
             Route::Create => {
                 let spec: CreateSpec = serde_json::from_value(body)?;
+                // "berth-" names are the daemon's own (the registry mirrors):
+                // a caller can't take one and stand in for another's mirror.
+                if spec.name.as_deref().is_some_and(|n| n.starts_with("berth-")) {
+                    bail!("berth names can't start with \"berth-\"");
+                }
                 // A berth with Docker pulls through its tenant's mirror.
                 let registry = if registry::enabled() && registry::has_docker(&spec.image, &spec.layers) {
                     Some(self.registry_for(spec.tenant.as_deref())?)

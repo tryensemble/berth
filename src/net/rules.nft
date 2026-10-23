@@ -38,6 +38,8 @@ table bridge berth {
     type filter hook prerouting priority -10; policy accept;
     iifname "bh*" ether type ip iifname . ip saddr != @senders drop
     iifname "bh*" ether type arp iifname . arp saddr ip != @senders drop
-    iifname "bh*" ether type ip6 drop
+    # Only IPv4 and ARP leave a berth; IPv6, VLAN-tagged and the rest are
+    # dropped, so none can carry a borrowed or hidden source past the checks.
+    iifname "bh*" ether type != { ip, arp } drop
   }
 }

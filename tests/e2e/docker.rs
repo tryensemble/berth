@@ -71,16 +71,21 @@ fn docker_pulls_go_through_the_tenants_own_mirror() {
     let mirror_of = |b: &Berth| b.info()["registry"].as_u64().expect("a Docker berth has a registry mirror");
     let (our_port, their_port) = (mirror_of(&ours), mirror_of(&theirs));
     assert_ne!(our_port, their_port, "two tenants share a mirror");
+    // A caller can't take a registry mirror's name to stand in for one.
+    assert!(!crate::berth(&["create", "--layer", crate::layer(), "--name", &format!("berth-registry-{tenant}")]).status.success());
     assert!(ours.sh_ok("docker info 2>/dev/null").contains(&format!("http://10.200.0.1:{our_port}/")));
     // A berth reaches its own tenant's mirror and not another's.
     let reach =
         |b: &Berth, port: u64| b.sh(&format!("timeout 3 bash -c 'echo > /dev/tcp/10.200.0.1/{port}'")).status.success();
     assert!(reach(&ours, our_port));
     assert!(!reach(&ours, their_port), "a berth reached another tenant's mirror");
-    // And its pulls go through it.
-    ours.sh_ok("docker pull -q busybox >/dev/null");
-    let mirror = ok(&["ls", "--json"]);
-    assert!(mirror.contains(&format!("berth-registry-{tenant}")));
+    // And its pulls go through it: the mirror berth exists for this tenant,
+    // and the pull reaches it (whether the pull itself succeeds depends on
+    // the upstream, which may rate-limit a shared host).
+    assert!(ok(&["ls", "--json"]).contains(&format!("berth-registry-{tenant}")));
+    let pull = ours.sh("docker pull -q busybox 2>&1");
+    let out = String::from_utf8_lossy(&pull.stdout);
+    assert!(pull.status.success() || out.contains("Too Many Requests"), "pull didn't reach the mirror: {out}");
     // The tenant's mirror goes when we're done; it's made again when needed.
     drop(ours);
     let _ = crate::berth(&["destroy", &format!("berth-registry-{tenant}")]);

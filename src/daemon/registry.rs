@@ -57,7 +57,13 @@ impl Daemon {
     pub fn registry_for(self: &Arc<Self>, tenant: Option<&str>) -> anyhow::Result<u16> {
         let _one = self.registry_lock.lock().unwrap();
         let name = name(tenant);
-        let existing = self.berths.lock().unwrap().values().find(|b| b.name.as_deref() == Some(&name)).cloned();
+        let existing = self
+            .berths
+            .lock()
+            .unwrap()
+            .values()
+            .find(|b| b.name.as_deref() == Some(&name) && b.tenant.as_deref() == tenant)
+            .cloned();
         if let Some(b) = existing {
             if let Some(p) = b.published.iter().find(|p| p.port == 5000) {
                 return Ok(p.host_port);

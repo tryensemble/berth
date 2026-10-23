@@ -243,5 +243,6 @@ mod tests {
         assert!(RULES.contains("ip saddr . tcp dport @host_access accept"));
         assert!(RULES.contains("iifname . ip saddr != @senders drop"));
         assert!(RULES.contains("iifname . arp saddr ip != @senders drop"));
+        assert!(RULES.contains("ether type != { ip, arp } drop"));
     }
 }
