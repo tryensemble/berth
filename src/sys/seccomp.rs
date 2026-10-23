@@ -118,6 +118,10 @@ pub fn program() -> Vec<libc::sock_filter> {
         jump(JEQ_K, AUDIT_ARCH, 1, 0),
         stmt(RET_K, RET_ERRNO | libc::ENOSYS as u32),
         stmt(LD_W_ABS, NR),
+        // -1 is no call: a ptrace tracer (proot, gdb) skipping one. The
+        // kernel answers it ENOSYS itself unless the tracer set a result.
+        jump(JEQ_K, u32::MAX, 0, 1),
+        stmt(RET_K, RET_ALLOW),
     ];
     #[cfg(target_arch = "x86_64")]
     {
@@ -295,6 +299,8 @@ mod tests {
         assert_eq!(call(NEWEST_REVIEWED as libc::c_long, 0), RET_ALLOW);
         assert_eq!(call(NEWEST_REVIEWED as libc::c_long + 1, 0), ENOSYS);
         assert_eq!(call(1000, 0), ENOSYS);
+        // A tracer's skipped call keeps the result the tracer gave it.
+        assert_eq!(run(&p, AUDIT_ARCH, u32::MAX, 0), RET_ALLOW);
         // Another architecture's calls.
         assert_eq!(run(&p, 0x4000_0003, libc::SYS_read as u32, 0), ENOSYS);
     }
