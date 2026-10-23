@@ -33,9 +33,11 @@ Known limits, which aren't bugs to report:
   Docker, bubblewrap and gVisor can mount their own `/proc`: berth root can
   see past them, but the kernel's own checks still keep it from anything
   that matters (see [the architecture](docs/ARCHITECTURE.md#isolation-of-a-berth)).
-- Accounts from a directory service (LDAP, SSSD) aren't in `/etc/passwd`, so
-  the daemon can't check their ids: keep them out of berth's range (868928
-  up).
+- The daemon checks `/etc/passwd`, `/etc/group`, `/etc/subuid` and
+  `/etc/subgid` against berth's ids (868928 up), but can't see ids handed out
+  elsewhere: directory-service accounts (LDAP, SSSD), or ranges
+  systemd-nspawn, Incus or LXD pick for themselves. Keep those out of the
+  range.
 - Members of the `berth` group control every berth on the machine, and can
   reach any berth's ports through its SOCKS socket; the group is for
   operators, not for the agents.

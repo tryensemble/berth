@@ -53,10 +53,16 @@ fn a_fresh_proc_gives_root_nothing_the_masks_hide() {
     for write in ["sysrq-trigger", "sys/kernel/core_pattern", "sys/kernel/sysrq", "sys/vm/drop_caches"] {
         assert!(!root_tries(&format!("echo 1 > /tmp/p/{write}")), "wrote /proc/{write}");
     }
-    // Symbols, but no addresses.
+    // Symbols, but no addresses (on a host with the default kptr_restrict).
     assert_eq!(b.root("cut -d' ' -f1 /tmp/p/kallsyms | sort -u"), "0000000000000000");
-    // And no fresh /sys past its masks.
+    // A fresh /sys mounts read-only only, and shows what any user on the host
+    // may read: not the firmware's tables.
     assert!(!root_tries("mkdir /tmp/s && mount -t sysfs sysfs /tmp/s"));
+    b.root("mount -t sysfs -o ro sysfs /tmp/s");
+    let tables = b.root("find /tmp/s/firmware/acpi/tables /tmp/s/firmware/dmi/tables -type f 2>/dev/null | head -50");
+    for table in tables.lines() {
+        assert!(!root_tries(&format!("head -c1 {table}")), "read {table}");
+    }
 }
 
 #[test]
@@ -69,11 +75,14 @@ fn device_nodes_outside_dev_dont_open() {
     for mount in ["/", "/workspace"] {
         assert!(opts(mount).split(',').any(|o| o == "nodev"), "{mount} isn't nodev: {}", opts(mount));
     }
-    // The host locked the flag: berth root can't take it off, nor make a node.
+    // The root (and the project mirror) are the daemon's mounts, so the flag
+    // is locked: berth root can't take it off, there or on a bind of it.
     let root_tries = |cmd: &str| berth(&["exec", "-u", "root", &b.0, "--", "sh", "-c", cmd]).status.success();
     assert!(!root_tries("mount -o remount,bind,dev /"));
     assert!(!root_tries("mkdir /tmp/r && mount --bind / /tmp/r && mount -o remount,bind,dev /tmp/r"));
-    assert!(!root_tries("mknod /tmp/disk b 253 0"));
+    // The workspace bind is init's own, so not locked; it doesn't need to be,
+    // since nothing that writes there can make a device node.
+    assert!(!root_tries("mknod /workspace/disk b 253 0"));
     // /dev's own devices still work.
     assert_eq!(b.root("head -c 3 /dev/zero | wc -c"), "3");
 }
