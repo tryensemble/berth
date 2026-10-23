@@ -8,7 +8,7 @@ const SLOW: Duration = Duration::from_secs(60);
 
 /// A berth with git, sudo and Docker.
 fn docker_berth() -> Berth {
-    Berth::new_with_layers(&["e2e", "e2e-docker"], &["--memory", "3G"])
+    Berth::new_with_layers(&[crate::layer(), crate::docker_layer()], &["--memory", "3G"])
 }
 
 #[test]

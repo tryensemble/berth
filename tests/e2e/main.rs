@@ -14,14 +14,13 @@ mod basics;
 mod docker;
 mod hardening;
 mod lifecycle;
+mod ports;
+mod snapshots;
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-
-/// The layer most tests build on: git, and the agent user.
-pub const LAYER: &str = "e2e";
 
 pub fn berth(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_berth")).args(args).output().expect("running berth")
@@ -41,45 +40,69 @@ pub fn ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Builds the shared test layer once per run.
-pub fn layer() -> &'static str {
-    static BUILT: OnceLock<()> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let script = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            script.path(),
-            "set -e
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends ca-certificates git sudo >/dev/null
-            userdel -r ubuntu 2>/dev/null || true
-            useradd -m -u 1000 -s /bin/bash agent
-            echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
-            rm -rf /var/lib/apt/lists/*",
-        )
-        .unwrap();
-        ok(&["layer", "build", LAYER, &script.path().display().to_string()]);
+/// Builds a layer from script on top of from, named after both so it's
+/// rebuilt only when they change, and only once per run. A failed build is
+/// remembered: every test that needs it fails with the same message rather
+/// than building it again.
+fn built(cell: &'static OnceLock<Result<String, String>>, script: &str, from: &[&str]) -> &'static str {
+    let result = cell.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (script, from).hash(&mut h);
+        let name = format!("e2e-{:08x}", h.finish() as u32);
+        if ok(&["layer", "ls"]).lines().any(|l| l == name) {
+            return Ok(name);
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), script).unwrap();
+        let mut args = vec!["layer", "build", &name];
+        for f in from {
+            args.extend(["--from", f]);
+        }
+        let path = file.path().display().to_string();
+        args.push(&path);
+        let out = berth(&args);
+        if out.status.success() {
+            Ok(name)
+        } else {
+            Err(format!("building {name}: {}", String::from_utf8_lossy(&out.stderr)))
+        }
     });
-    LAYER
+    match result {
+        Ok(name) => name,
+        Err(e) => panic!("{e}"),
+    }
 }
 
-/// A Docker layer on top of the test layer, built once.
+/// The layer most tests build on: git, sudo, and the agent user.
+pub fn layer() -> &'static str {
+    static CELL: OnceLock<Result<String, String>> = OnceLock::new();
+    built(
+        &CELL,
+        "set -e
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends ca-certificates git sudo >/dev/null
+        userdel -r ubuntu 2>/dev/null || true
+        useradd -m -u 1000 -s /bin/bash agent
+        echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
+        rm -rf /var/lib/apt/lists/*",
+        &[],
+    )
+}
+
+/// Docker, on top of the test layer.
 pub fn docker_layer() -> &'static str {
-    static BUILT: OnceLock<()> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        layer();
-        let script = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            script.path(),
-            "set -e
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends docker.io docker-compose-v2 iptables >/dev/null
-            usermod -aG docker agent
-            rm -rf /var/lib/apt/lists/*",
-        )
-        .unwrap();
-        ok(&["layer", "build", "e2e-docker", "--from", LAYER, &script.path().display().to_string()]);
-    });
-    "e2e-docker"
+    static CELL: OnceLock<Result<String, String>> = OnceLock::new();
+    let base = layer();
+    built(
+        &CELL,
+        "set -e
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends docker.io docker-compose-v2 iptables >/dev/null
+        usermod -aG docker agent
+        rm -rf /var/lib/apt/lists/*",
+        &[base],
+    )
 }
 
 /// A berth that's destroyed when the test ends, pass or fail.
@@ -87,12 +110,10 @@ pub struct Berth(pub String);
 
 impl Berth {
     pub fn new(args: &[&str]) -> Berth {
-        layer();
-        Berth::new_with_layers(&[LAYER], args)
+        Berth::new_with_layers(&[layer()], args)
     }
 
     pub fn new_with_layers(layers: &[&str], args: &[&str]) -> Berth {
-        docker_layer();
         let mut all = vec!["create".to_string()];
         for l in layers {
             all.push("--layer".into());
@@ -156,15 +177,17 @@ pub fn wait_up_to(limit: Duration, mut f: impl FnMut() -> bool) {
     }
 }
 
-/// Fetches / from port through `berth proxy`.
+/// Fetches / from port through `berth proxy`; empty if nothing answers yet.
 pub fn get(id: &str, port: u16) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["proxy", id, &port.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+    // The proxy exits at once when nothing listens; then this write fails.
+    let _ = child.stdin.take().unwrap().write_all(b"GET / HTTP/1.0\r\n\r\n");
     let out = child.wait_with_output().unwrap();
     String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or("").to_string()
 }
