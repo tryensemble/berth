@@ -17,6 +17,7 @@ mod hardening;
 mod lifecycle;
 mod ports;
 mod snapshots;
+mod strict;
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -45,7 +46,7 @@ pub fn ok(args: &[&str]) -> String {
 /// rebuilt only when they change, and only once per run. A failed build is
 /// remembered: every test that needs it fails with the same message rather
 /// than building it again.
-fn built(cell: &'static OnceLock<Result<String, String>>, script: &str, from: &[&str]) -> &'static str {
+pub(crate) fn built(cell: &'static OnceLock<Result<String, String>>, script: &str, from: &[&str]) -> &'static str {
     let result = cell.get_or_init(|| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -156,7 +157,9 @@ impl Berth {
             while (my $c = $s->accept) {{ <$c>; print $c "HTTP/1.0 200 OK\r\n\r\n{text}\n"; close $c }}"#
         );
         ok(&["exec", "-d", "--name", "web", &self.0, "--", "perl", "-e", &server]);
-        wait_for(|| self.sh("cat /proc/net/tcp | grep -q ' 0A '").status.success());
+        // Read readiness from the berth's own netns (berth ports), which works
+        // whether or not the command runs under gVisor.
+        wait_for(|| ok(&["ports", &self.0]).split_whitespace().any(|p| p == port.to_string()));
     }
 }
 

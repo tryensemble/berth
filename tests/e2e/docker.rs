@@ -72,7 +72,11 @@ fn docker_pulls_go_through_the_tenants_own_mirror() {
     let (our_port, their_port) = (mirror_of(&ours), mirror_of(&theirs));
     assert_ne!(our_port, their_port, "two tenants share a mirror");
     // A caller can't take a registry mirror's name to stand in for one.
-    assert!(!crate::berth(&["create", "--layer", crate::layer(), "--name", &format!("berth-registry-{tenant}")]).status.success());
+    assert!(
+        !crate::berth(&["create", "--layer", crate::layer(), "--name", &format!("berth-registry-{tenant}")])
+            .status
+            .success()
+    );
     assert!(ours.sh_ok("docker info 2>/dev/null").contains(&format!("http://10.200.0.1:{our_port}/")));
     // A berth reaches its own tenant's mirror and not another's.
     let reach =
