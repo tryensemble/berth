@@ -1,0 +1,15 @@
+[Unit]
+Description=berth daemon: light, isolated boxes for agent threads
+Documentation=https://github.com/tryensemble/berth
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/berthd
+Restart=on-failure
+# Berths run in their own cgroups under /sys/fs/cgroup/berth, not the
+# service's: restarting or stopping the daemon leaves them running.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
