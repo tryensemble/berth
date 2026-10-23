@@ -110,7 +110,11 @@ fn pid1(cfg: InitConfig) -> anyhow::Result<()> {
 
     let reaper = Reaper::start();
     let services = Services::default();
-    if let Err(e) = docker::start(&cfg.docker, &reaper) {
+    // Docker's daemon and containers would run on the host kernel, which
+    // strict mode exists to avoid, so it isn't started in a strict berth.
+    if !cfg.strict
+        && let Err(e) = docker::start(&cfg.docker, &reaper)
+    {
         eprintln!("berth-init: no Docker: {e:#}");
     }
     // The control socket is init's alone: nothing it starts may inherit it.

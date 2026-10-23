@@ -67,6 +67,12 @@ berth's answer, in order:
    unprotected. A command gets an `isatty()` terminal but not yet a
    controlling tty (enough for Claude Code); full job control is future work.
 
+   One honest limit: `--network=host` means the sandbox uses the berth's own
+   network sockets, so network syscalls still reach the host kernel (that's
+   what lets the berth's ports, `proxy` and SOCKS keep working). The berth's
+   network namespace and nftables rules still confine it; what strict mode
+   removes is the host-kernel surface of everything that isn't networking.
+
 ## Processes
 
 One binary, three roles:
@@ -282,8 +288,11 @@ served.
   machine whose address Docker Hub rate-limits can use `mirror.gcr.io`).
 
 Docker is the part of a berth that reaches the most kernel surface (mounts,
-namespaces, netfilter). Strict mode runs it under gVisor with the rest of the
-berth.
+namespaces, netfilter). A **strict** berth therefore doesn't run Docker: its
+daemon and containers would run on the host kernel, which is exactly what
+strict mode avoids. Running Docker's containers themselves under gVisor (its
+`runsc` runtime) is future work; for now a berth is either strict or runs
+Docker, not both.
 
 ## Agents in the berth
 

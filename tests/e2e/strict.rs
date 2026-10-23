@@ -87,6 +87,32 @@ fn strict_berths_still_cant_reach_each_other_or_the_host() {
 
 #[test]
 #[ignore = "needs a running berthd with the gvisor layer; run with --ignored"]
+fn a_commands_secrets_arent_readable_by_other_processes() {
+    let b = strict_berth();
+    // A service holding a secret in its environment.
+    ok(&["exec", "-d", "--name", "svc", &b.0, "-e", "SECRET_TOKEN=supersekret", "--", "sleep", "300"]);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // The agent (the usual unprivileged user) can't read the sandbox bundles.
+    let dump = b.sh("grep -rh SECRET_TOKEN /run/berth-strict 2>/dev/null");
+    assert!(!String::from_utf8_lossy(&dump.stdout).contains("supersekret"), "a command's secret env was readable");
+    // The tree itself is closed to the agent.
+    assert!(!b.sh("ls /run/berth-strict").status.success());
+}
+
+#[test]
+#[ignore = "needs a running berthd with the gvisor layer; run with --ignored"]
+fn docker_is_off_in_a_strict_berth() {
+    // Docker would run on the host kernel, so strict berths don't start it.
+    let b = Berth::new_with_layers(
+        &[crate::layer(), crate::docker_layer(), gvisor_layer()],
+        &["--strict", "--memory", "3G"],
+    );
+    assert!(b.sh_ok("uname -r").ends_with("-gvisor"));
+    assert!(!b.sh("timeout 10 docker info").status.success(), "Docker ran in a strict berth");
+}
+
+#[test]
+#[ignore = "needs a running berthd with the gvisor layer; run with --ignored"]
 fn a_strict_berth_idles_and_wakes() {
     let b = strict_berth();
     b.serve("127.0.0.1", 3000, "awake");

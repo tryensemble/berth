@@ -13,6 +13,7 @@
 //! sandbox over a shared read bind of the berth's root.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,11 +48,15 @@ pub fn setup() -> anyhow::Result<()> {
     if !available() {
         bail!("this berth is strict but has no {RUNSC}; add the gvisor layer");
     }
-    let root = rootfs();
-    fs::create_dir_all(&root)?;
+    // Bundles under here hold each command's environment (its secrets), so the
+    // tree is the berth-root's alone, not readable by the agent or anyone else.
+    fs::create_dir_all(DIR)?;
+    fs::set_permissions(DIR, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir_all(rootfs())?;
     fs::create_dir_all(state())?;
     use libc::{MS_BIND, MS_REC};
-    sys::mount(Some("/"), &root, None, MS_BIND | MS_REC, None).context("binding the berth's root for strict mode")?;
+    sys::mount(Some("/"), &rootfs(), None, MS_BIND | MS_REC, None)
+        .context("binding the berth's root for strict mode")?;
     Ok(())
 }
 
@@ -62,6 +67,7 @@ pub fn command(r: &Resolved) -> anyhow::Result<Command> {
     let id = format!("berth-{:08x}", rand());
     let bundle = Path::new(DIR).join(&id);
     fs::create_dir_all(&bundle)?;
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700))?;
     write_config(&bundle, r)?;
 
     // A wrapper so the sandbox and bundle are removed however runsc exits,
@@ -139,7 +145,10 @@ fn write_config(bundle: &Path, r: &Resolved) -> anyhow::Result<()> {
         // are the berth's and its network rules still hold.
         "linux": { "namespaces": [{ "type": "pid" }, { "type": "ipc" }, { "type": "uts" }, { "type": "mount" }] },
     });
-    fs::write(bundle.join("config.json"), serde_json::to_vec(&config)?)?;
+    // 0600: the config embeds the command's environment, secrets and all.
+    let path = bundle.join("config.json");
+    fs::write(&path, serde_json::to_vec(&config)?)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
