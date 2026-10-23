@@ -215,6 +215,18 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Cmd::Layer(LayerCmd::Build { name, script, image, from }) => {
             let script = std::fs::read_to_string(&script).with_context(|| format!("reading {}", script.display()))?;
+            // Fail before building, not after: a layer berths use can't be replaced.
+            let berths = api.json("GET", "/v1/berths", None)?;
+            let users: Vec<&str> = berths
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|b| b["layers"].as_array().is_some_and(|l| l.iter().any(|l| l == name.as_str())))
+                .filter_map(|b| b["id"].as_str())
+                .collect();
+            if !users.is_empty() {
+                bail!("layer {name} is used by berths {}; destroy them first", users.join(", "));
+            }
             let b =
                 api.json("POST", "/v1/berths", Some(&json!({ "image": image, "layers": from, "idle_after": "0" })))?;
             let id = b["id"].as_str().context("no id")?.to_string();
@@ -226,12 +238,17 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                 env: vec!["DEBIAN_FRONTEND=noninteractive".into()],
                 ..Default::default()
             };
-            let code = exec(&api, &id, spec)?;
-            if code != 0 {
+            // The builder berth goes whatever happens; on success, as the layer.
+            let built = exec(&api, &id, spec).and_then(|code| {
+                if code != 0 {
+                    bail!("the script failed with exit code {code}");
+                }
+                api.json("POST", "/v1/layers", Some(&json!({ "berth": id, "name": name })))
+            });
+            if let Err(e) = built {
                 let _ = api.json("DELETE", &format!("/v1/berths/{id}"), None);
-                bail!("the script failed with exit code {code}");
+                return Err(e);
             }
-            api.json("POST", "/v1/layers", Some(&json!({ "berth": id, "name": name })))?;
             eprintln!("berth: layer {name} is ready");
             Ok(0)
         }
