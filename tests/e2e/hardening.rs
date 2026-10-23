@@ -10,8 +10,9 @@ use crate::{Berth, berth, ok};
 #[cfg(target_arch = "x86_64")]
 fn dangerous_kernel_calls_are_refused_even_to_root() {
     let b = Berth::new(&[]);
-    // x86_64 numbers: bpf, keyctl, io_uring_setup, userfaultfd, perf_event_open, init_module, kexec_load.
-    let calls = [321, 250, 425, 323, 298, 175, 246];
+    // x86_64 numbers: bpf, keyctl, io_uring_setup, userfaultfd, perf_event_open, init_module, kexec_load,
+    // kcmp, mbind, migrate_pages.
+    let calls = [321, 250, 425, 323, 298, 175, 246, 312, 237, 256];
     let script = format!(
         r#"use Errno; for my $n ({}) {{ syscall($n, 0, 0, 0, 0, 0); print "$n ", ($!{{EPERM}} || $!{{ENOSYS}} ? "refused" : "allowed: $!"), "\n" }}"#,
         calls.map(|c| c.to_string()).join(",")
@@ -21,6 +22,8 @@ fn dangerous_kernel_calls_are_refused_even_to_root() {
         assert!(line.ends_with("refused"), "{line}");
     }
     assert_eq!(out.lines().count(), calls.len());
+    // Harmless personalities still work: gdb's, through setarch.
+    assert_eq!(b.sh_ok("setarch -R cat /proc/self/personality"), "00040000");
 }
 
 #[test]
@@ -33,6 +36,27 @@ fn the_hosts_kernel_views_are_hidden() {
     assert!(!out.status.success(), "kernel tunables are read-only");
     // The berth's own network's tunables are its own.
     b.root("echo 1 > /proc/sys/net/ipv4/ip_forward");
+}
+
+#[test]
+#[ignore = "needs a running berthd; run with --ignored"]
+fn a_fresh_proc_gives_root_nothing_the_masks_hide() {
+    // The masks are berth root's own mounts, so it could mount a fresh /proc
+    // past them; they can't be locked without stopping Docker, bubblewrap and
+    // gVisor mounting theirs. What matters is behind the kernel's own checks.
+    let b = Berth::new(&[]);
+    b.root("mkdir /tmp/p && mount -t proc proc /tmp/p");
+    let root_tries = |cmd: &str| berth(&["exec", "-u", "root", &b.0, "--", "sh", "-c", cmd]).status.success();
+    for file in ["kcore", "timer_list", "sysrq-trigger"] {
+        assert!(!root_tries(&format!("head -c1 /tmp/p/{file}")), "read /proc/{file}");
+    }
+    for write in ["sysrq-trigger", "sys/kernel/core_pattern", "sys/kernel/sysrq", "sys/vm/drop_caches"] {
+        assert!(!root_tries(&format!("echo 1 > /tmp/p/{write}")), "wrote /proc/{write}");
+    }
+    // Symbols, but no addresses.
+    assert_eq!(b.root("cut -d' ' -f1 /tmp/p/kallsyms | sort -u"), "0000000000000000");
+    // And no fresh /sys past its masks.
+    assert!(!root_tries("mkdir /tmp/s && mount -t sysfs sysfs /tmp/s"));
 }
 
 #[test]
