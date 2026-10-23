@@ -217,6 +217,19 @@ fn pump_out(mut out: Box<dyn Read + Send>, kind: u8, frames: Frames, done: mpsc:
     });
 }
 
+/// A new pty's two ends, both close-on-exec from the start: init runs
+/// commands from several threads, and one spawned meanwhile mustn't inherit
+/// another session's terminal.
+fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let master = unsafe { OwnedFd::from_raw_fd(sys::cvt(libc::posix_openpt(flags))?) };
+    sys::cvt(unsafe { libc::grantpt(master.as_raw_fd()) })?;
+    sys::cvt(unsafe { libc::unlockpt(master.as_raw_fd()) })?;
+    const TIOCGPTPEER: libc::c_ulong = 0x5441;
+    let slave = sys::cvt(unsafe { libc::ioctl(master.as_raw_fd(), TIOCGPTPEER as _, flags) })?;
+    Ok((master, unsafe { OwnedFd::from_raw_fd(slave) }))
+}
+
 fn set_size(fd: i32, rows: u16, cols: u16) {
     if rows == 0 || cols == 0 {
         return;
@@ -226,13 +239,7 @@ fn set_size(fd: i32, rows: u16, cols: u16) {
 }
 
 fn run_tty(spec: ExecSpec, mut cmd: Command, stream: UnixStream, frames: Frames, reaper: Reaper) -> anyhow::Result<()> {
-    let (mut master, mut slave) = (0, 0);
-    sys::cvt(unsafe {
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
-    })?;
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    let (master, slave) = open_pty()?;
     set_size(master.as_raw_fd(), spec.rows, spec.cols);
     let s = File::from(slave);
     cmd.stdin(s.try_clone()?).stdout(s.try_clone()?).stderr(s.try_clone()?);
