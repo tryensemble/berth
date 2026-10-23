@@ -3,6 +3,7 @@
 mod activity;
 mod berth;
 mod cgroup;
+mod ids;
 mod layer;
 mod lifecycle;
 mod paths;
@@ -63,6 +64,7 @@ pub fn main() -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("berthd runs as root");
     }
+    ids::check_and_reserve()?;
     // Berths' inits enter berths/<id> as their own root. Images, layers and
     // repos are only ever read or mounted by the daemon (they hold setuid
     // files and private source): no one else may reach them.
