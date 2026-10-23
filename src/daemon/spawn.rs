@@ -12,6 +12,10 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 
 use super::UID_COUNT;
+
+/// The daemon's own binary, which also plays a berth's init. Through /proc so
+/// it's this very binary even after an upgrade replaced the file on disk.
+const SELF: &str = "/proc/self/exe";
 use super::berth::Berth;
 use crate::api::{ExecSpec, InitRequest, frames};
 use crate::init::{InitConfig, LISTEN_FD};
@@ -19,7 +23,7 @@ use crate::sys;
 
 /// A user namespace mapping ids 0..65536 to base.., kept by its fd.
 pub fn new_userns(base: u32) -> anyhow::Result<OwnedFd> {
-    let mut cmd = Command::new(std::env::current_exe()?);
+    let mut cmd = Command::new(SELF);
     cmd.arg("__hold").stdin(Stdio::piped()).stdout(Stdio::null());
     unsafe {
         cmd.pre_exec(|| sys::cvt(libc::unshare(libc::CLONE_NEWUSER)).map(drop));
@@ -48,8 +52,9 @@ pub fn spawn_init(
     let procs = File::options().write(true).open(b.cgroup().join("cgroup.procs"))?;
     let log = File::create(b.dir().join("init.log"))?;
     let (pfd, ufd, lfd) = (procs.as_raw_fd(), userns.as_raw_fd(), listener.as_raw_fd());
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("__init")
+    let mut cmd = Command::new(SELF);
+    cmd.arg0("berth-init")
+        .arg("__init")
         .env_clear()
         .env("BERTH_INIT_CONFIG", serde_json::to_string(cfg)?)
         .stdin(Stdio::piped())
