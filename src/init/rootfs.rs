@@ -52,7 +52,7 @@ pub fn build_root(cfg: &InitConfig) -> anyhow::Result<()> {
     sys::mount(Some("tmpfs"), &tmp, Some("tmpfs"), MS_NOSUID | MS_NODEV, Some(&size))?;
 
     let workspace = mount_point("workspace")?;
-    sys::mount(Some(path_str(&cfg.workspace)), &workspace, None, MS_BIND, None)?;
+    bind(&cfg.workspace, &workspace, false)?;
     // The project mirror, if any, is already mounted at /berth/repo.git by
     // the daemon; the recursive bind of the root above carries it in.
     for b in &cfg.binds {
@@ -77,12 +77,35 @@ pub fn build_root(cfg: &InitConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Binds a host directory in. Its devices stay shut, as on the root.
 fn bind(source: &Path, target: &Path, read_only: bool) -> anyhow::Result<()> {
     sys::mount(Some(path_str(source)), target, None, MS_BIND, None)?;
-    if read_only {
-        sys::mount(None, target, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None)?;
-    }
+    let ro = if read_only { MS_RDONLY } else { 0 };
+    // A remount in a user namespace must keep the flags the host's mount
+    // locked (nosuid, noexec, atime), so it starts from them.
+    let flags = held_flags(target)? | MS_BIND | MS_REMOUNT | MS_NODEV | ro;
+    sys::mount(None, target, None, flags, None)?;
     Ok(())
+}
+
+/// The mount flags path's mount has now, as mount(2) flags.
+fn held_flags(path: &Path) -> anyhow::Result<libc::c_ulong> {
+    let p = sys::cstr(path);
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    sys::cvt(unsafe { libc::statvfs(p.as_ptr(), &mut st) })?;
+    let f = st.f_flag;
+    // Not in the libc crate's musl bindings.
+    const ST_RELATIME: libc::c_ulong = 0x1000;
+    let map = [
+        (libc::ST_RDONLY, MS_RDONLY),
+        (libc::ST_NOSUID, MS_NOSUID),
+        (libc::ST_NODEV, MS_NODEV),
+        (libc::ST_NOEXEC, MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
+    ];
+    Ok(map.iter().filter(|(st, _)| f & st != 0).fold(0, |acc, (_, ms)| acc | ms))
 }
 
 /// Hides what in /proc and /sys tells about, or reaches into, the host.

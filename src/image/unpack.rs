@@ -5,7 +5,8 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Unpacks a layer tarball over root. `.wh.<name>` removes name from the
-/// layers below; `.wh..wh..opq` empties its directory first.
+/// layers below; `.wh..wh..opq` empties its directory first. Device nodes are
+/// left out: a berth gets its devices from its own /dev, never from an image.
 pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
     let reader: Box<dyn Read> = if gzip { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
     let mut archive = tar::Archive::new(reader);
@@ -15,6 +16,10 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_block_special() || kind.is_character_special() {
+            continue;
+        }
         let path = entry.path()?.into_owned();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if let Some(hidden) = name.strip_prefix(".wh.") {
@@ -187,5 +192,31 @@ mod tests {
         unpack_layer(layer(&[E::Dir("etc"), E::File("etc/drop", b"1")]), r, false).unwrap();
         unpack_layer(raw_entry(b"./etc/.wh.drop"), r, false).unwrap();
         assert!(!r.join("etc/drop").exists());
+    }
+
+    #[test]
+    fn device_nodes_are_left_out() {
+        let mut b = tar::Builder::new(tempfile::tempfile().unwrap());
+        for (name, kind) in [("disk", tar::EntryType::Block), ("mem", tar::EntryType::Char)] {
+            let mut h = header();
+            h.set_entry_type(kind);
+            h.set_mode(0o666);
+            h.set_size(0);
+            h.set_device_major(253).unwrap();
+            h.set_device_minor(0).unwrap();
+            b.append_data(&mut h, name, io::empty()).unwrap();
+        }
+        let mut h = header();
+        h.set_mode(0o644);
+        h.set_size(2);
+        b.append_data(&mut h, "kept", &b"ok"[..]).unwrap();
+        let mut f = b.into_inner().unwrap();
+        f.rewind().unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        unpack_layer(f, root.path(), false).unwrap();
+        assert!(fs::symlink_metadata(root.path().join("disk")).is_err());
+        assert!(fs::symlink_metadata(root.path().join("mem")).is_err());
+        assert_eq!(fs::read_to_string(root.path().join("kept")).unwrap(), "ok");
     }
 }

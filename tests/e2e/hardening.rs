@@ -37,6 +37,25 @@ fn the_hosts_kernel_views_are_hidden() {
 
 #[test]
 #[ignore = "needs a running berthd; run with --ignored"]
+fn device_nodes_outside_dev_dont_open() {
+    // The root and the host directories bound in are mounted nodev, so a
+    // device node an image or layer carries can't reach the host's disks.
+    let b = Berth::new(&[]);
+    let opts = |mount: &str| b.root(&format!("awk '$5 == \"{mount}\" {{ print $6 }}' /proc/self/mountinfo"));
+    for mount in ["/", "/workspace"] {
+        assert!(opts(mount).split(',').any(|o| o == "nodev"), "{mount} isn't nodev: {}", opts(mount));
+    }
+    // The host locked the flag: berth root can't take it off, nor make a node.
+    let root_tries = |cmd: &str| berth(&["exec", "-u", "root", &b.0, "--", "sh", "-c", cmd]).status.success();
+    assert!(!root_tries("mount -o remount,bind,dev /"));
+    assert!(!root_tries("mkdir /tmp/r && mount --bind / /tmp/r && mount -o remount,bind,dev /tmp/r"));
+    assert!(!root_tries("mknod /tmp/disk b 253 0"));
+    // /dev's own devices still work.
+    assert_eq!(b.root("head -c 3 /dev/zero | wc -c"), "3");
+}
+
+#[test]
+#[ignore = "needs a running berthd; run with --ignored"]
 fn a_berth_owns_its_cgroup_but_not_its_limits() {
     let b = Berth::new(&["--memory", "256M"]);
     assert_eq!(b.root("cat /sys/fs/cgroup/cgroup.controllers"), "cpu memory pids");

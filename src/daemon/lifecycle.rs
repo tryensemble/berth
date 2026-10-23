@@ -170,7 +170,8 @@ impl Daemon {
             // /berth symlink); then the mount can't land outside the berth.
             let repo = sys::beneath::ensure_dir(&d.join("root"), std::path::Path::new("berth/repo.git"), true)?;
             sys::mount(Some(&mirror.display().to_string()), &repo, None, libc::MS_BIND, None)?;
-            sys::mount(None, &repo, None, libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, None)?;
+            let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID;
+            sys::mount(None, &repo, None, flags, None)?;
         }
         cgroup::create(b)?;
 
@@ -243,7 +244,11 @@ impl Daemon {
                 d.join("upper").display(),
                 d.join("work").display()
             );
-            mounted = sys::mount(Some("overlay"), &d.join("root"), Some("overlay"), 0, Some(&data))
+            // nodev: the overlay is mounted by host root, so the kernel would
+            // honour a device node an image or layer carries, and berth root
+            // could open the host's disks through it. The berth's own /dev is
+            // mounted over this, with only the harmless devices.
+            mounted = sys::mount(Some("overlay"), &d.join("root"), Some("overlay"), libc::MS_NODEV, Some(&data))
                 .context("mounting the berth's root");
         }
         // The overlay keeps its own references to its layers.
