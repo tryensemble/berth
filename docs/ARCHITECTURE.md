@@ -47,8 +47,9 @@ berth's answer, in order:
 2. Keep the computer's kernel patched (Ubuntu's livepatch where available).
 3. A **strict** mode per berth for when that isn't enough: the same berth, run
    under gVisor, a user-space kernel that sits between the berth's programs and
-   the real kernel. It still reserves nothing and starts in milliseconds; it
-   costs some speed on file-heavy work (installs, builds). It's an option per
+   the real kernel. It still reserves nothing and starts in milliseconds (a
+   workload runs under its kernel in about 70 ms, measured); it costs some
+   speed on file-heavy work (installs, builds). It's an option per
    berth, behind the `Sandbox` trait, not part of the first prototype.
 
 ## Processes
@@ -388,7 +389,8 @@ Ensemble.
 - Linux 6.8 (Ubuntu 24.04), cgroup v2, nftables, swap (set up by the daemon
   when missing), XFS with reflinks for `/var/lib/berth` (recommended).
 - Nothing but the `berth` binary (static, musl). Strict mode adds gVisor's
-  `runsc`, which the daemon downloads and checks itself.
+  `runsc`, from its GitHub release tarball, which the daemon downloads and
+  verifies against the release's SHA512SUMS, pinned to a known-good release.
 
 ## Order of work
 

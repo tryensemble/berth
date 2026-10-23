@@ -284,7 +284,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
    on XFS; SOCKS sockets, published ports, names, host ports and a registry
    mirror per tenant. What an [Ensemble](https://github.com/tryensemble) driver
    needs is all there; [docs/ensemble.md](docs/ensemble.md) maps it.
-5. Strict mode: berths under gVisor, for code nobody vouches for.
+5. Strict mode: berths under gVisor, for code nobody vouches for (feasibility
+   verified; the backend is the next piece of work).
 
 ## License
 
