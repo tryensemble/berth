@@ -278,8 +278,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
 1. **Prototype** ✅ create, exec (terminal and detached), ports, proxy,
    destroy; images, layers and project checkouts; isolated networking.
 2. **Hardening** ✅ seccomp, masked `/proc`, delegated cgroups, link-safe
-   setup, Landlock around the daemon's root work. Idle, stop and wake.
-   Services.
+   setup, no devices outside `/dev`, images unpacked in a confined process,
+   Landlock around the daemon's root work, host ids kept out of berths'.
+   Idle, stop and wake. Services.
 3. **Docker inside a berth** ✅ its own dockerd, started on first use,
    containers in the berth's cgroup and network, pulls through its tenant's
    registry mirror.

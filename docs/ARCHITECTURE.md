@@ -128,25 +128,58 @@ from youki's crates and Codex's Linux sandbox:
   refuses the calls a berth has no use for and that reach the most kernel
   code: module and kernel loading, BPF, `perf_event_open`, io_uring,
   `userfaultfd`, the keyring, file handles, clock, swap and quota changes,
-  x32 and other architectures' calls. It's a denylist, not Docker's
-  allowlist, on purpose: a berth's root must be able to run Docker and nested
-  sandboxes (mount, unshare, setns, namespaced clone), which is most of what
-  an allowlist would remove; what's left beyond the denylist is guarded by
-  the user namespace. The filter is classic BPF built by berth itself, so the
-  binary stays static.
+  `kcmp` and the NUMA memory-policy calls, x32 and other architectures' calls.
+  `personality` takes only the harmless personalities (gdb's
+  no-randomization among them). It's a denylist, not Docker's allowlist, on
+  purpose: a berth's root must be able to run Docker and nested sandboxes
+  (mount, unshare, setns, namespaced clone), which is most of what an
+  allowlist would remove; what's left beyond the denylist is guarded by the
+  user namespace. A denylist alone would let through whatever calls later
+  kernels add, so every call numbered past the newest one reviewed (`listns`,
+  Linux 7.0) fails with ENOSYS, as on an older kernel, until it's reviewed.
+  The filter is classic BPF built by berth itself, so the binary stays static.
 - **Masked /proc and /sys**: `kcore`, `keys`, `kallsyms`, `timer_list`,
   `sched_debug` and `sysrq-trigger` read as empty, `/sys/firmware` and
   `/sys/kernel/security` are empty, and `/proc/sys` is read-only except the
-  berth's own network's tunables.
+  berth's own network's tunables. The masks keep the host out of sight, not
+  out of reach: they're the berth's own mounts, so its root could mount a
+  fresh `/proc` past them. They aren't locked, because the kernel refuses
+  every nested `/proc` mount once one is, and Docker, bubblewrap (the sandbox
+  Claude Code and Codex use) and gVisor all mount their own. What matters is
+  behind the kernel's own checks either way: a fresh `/proc` still won't
+  read `kcore` or `timer_list`, write `sysrq-trigger` or the host's
+  tunables, or show kernel addresses, and a fresh `/sys` won't mount; a
+  test holds this.
+- **No devices but /dev's**: the daemon mounts a berth's root, as host root,
+  `nodev`, and the project mirror and the host directories bound in too, with
+  the flag locked; images are unpacked without their device nodes. Without
+  it, a device node an image or layer carried would open the host's disks.
+  The berth's own `/dev` holds only `null`, `zero`, `full`, `random`,
+  `urandom`, `tty`, `fuse` and its own ptys.
 - **No links followed**: a stopped berth's files are its own, so when init
   builds its root again, and when the daemon makes a layer of it, every path
   inside is walked without following links, and mount points the berth
   replaced with links are made directories again.
+- **Image layers are unpacked in a process of their own**, never by the
+  daemon: as the unpack ids (which own nothing on the host) in a user
+  namespace, chrooted into an idmapped mount of the image that writes owners
+  back as ids from 0, with no network, `no_new_privs` and the berth's seccomp
+  filter. A path or link trick in a layer has nowhere to lead and a parser
+  bug nothing to reach. Only file capabilities and `user.*` extended
+  attributes are kept, never overlayfs's own `trusted.*`.
 - **Landlock** confines what the daemon does as root with what strangers
-  made: unpacking an image runs in a thread that may write only into that
+  send: downloading an image runs in a thread that may write only into that
   image's directory, and git fetches into a mirror only. It isn't applied to
   berths themselves: a Landlock domain can't mount, and Docker in a berth
   must, while inside the berth there's nothing but the berth to protect.
+- **Host ids stay out of berth's range**: a host user with ids in it, as an
+  account or as subordinate ids for newuidmap, would own a berth's files and
+  could signal its processes. berthd won't start while any `/etc/passwd`,
+  `/etc/group`, `/etc/subuid` or `/etc/subgid` entry overlaps the range, and
+  reserves it in `/etc/subuid` and `/etc/subgid` under the name `berth` (no
+  account has it) so `useradd` hands out subordinate ids elsewhere.
+  Directory-service accounts (LDAP, SSSD) aren't in those files, so their ids
+  must be kept out of the range by whoever runs the directory.
 - **The daemon never runs strangers' code or parsers as host root**: git
   fetches run as an id of their own that owns only the mirrors, and only over
   git's ordinary transports.

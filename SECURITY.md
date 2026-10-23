@@ -15,10 +15,12 @@ within a few working days.
 ## What berth defends, and what it doesn't
 
 Each berth has its own user, mount, PID, network, IPC, UTS and cgroup
-namespaces, and a root that's an unused uid range on the host. A seccomp filter
-refuses the kernel's riskiest calls, and `/proc` and `/sys` hide the host.
-Berths can't reach each other, the host, private networks or cloud metadata.
-The daemon never runs git or unpacks images as unconfined root. The
+namespaces, and a root that's an unused uid range on the host, which the
+daemon keeps every host account and subordinate range out of. A seccomp
+filter refuses the kernel's riskiest calls, `/proc` and `/sys` hide the host,
+and no device node outside the berth's own `/dev` opens. Berths can't reach
+each other, the host, private networks or cloud metadata. The daemon never
+runs git as root, and unpacks images in a confined process of their own. The
 end-to-end tests in [tests/e2e](tests/e2e) try these walls from inside a berth.
 
 Known limits, which aren't bugs to report:
@@ -27,6 +29,13 @@ Known limits, which aren't bugs to report:
   inside a berth can break the wall; keep the kernel patched. A berth made
   `--strict` runs its commands under gVisor, a user-space kernel, which closes
   that gap for code nobody vouches for, at some cost to speed.
+- `/proc` and `/sys` masks are berth root's own mounts, left unlocked so
+  Docker, bubblewrap and gVisor can mount their own `/proc`: berth root can
+  see past them, but the kernel's own checks still keep it from anything
+  that matters (see [the architecture](docs/ARCHITECTURE.md#isolation-of-a-berth)).
+- Accounts from a directory service (LDAP, SSSD) aren't in `/etc/passwd`, so
+  the daemon can't check their ids: keep them out of berth's range (868928
+  up).
 - Members of the `berth` group control every berth on the machine, and can
   reach any berth's ports through its SOCKS socket; the group is for
   operators, not for the agents.

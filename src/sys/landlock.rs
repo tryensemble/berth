@@ -1,9 +1,10 @@
 //! Landlock: confining what the calling thread (and what it starts) may write.
 //!
-//! The daemon does its riskiest work as host root: unpacking image layers and
-//! fetching repositories, both of which parse what strangers made. That work
-//! runs in a thread that first gives up writing anywhere but its own target
-//! directory, so a bug in a parser can't touch the rest of the machine.
+//! The daemon does some of its work as host root over what strangers send:
+//! downloading images (unpacking them happens in a process of its own) and
+//! fetching repositories. That work runs in a thread that first gives up
+//! writing anywhere but its own target directory, so a bug in it can't touch
+//! the rest of the machine.
 
 use std::ffi::CString;
 use std::io;
