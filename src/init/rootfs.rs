@@ -105,7 +105,13 @@ fn held_flags(path: &Path) -> anyhow::Result<libc::c_ulong> {
         (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
         (ST_RELATIME, libc::MS_RELATIME),
     ];
-    Ok(map.iter().filter(|(st, _)| f & st != 0).fold(0, |acc, (_, ms)| acc | ms))
+    let mut flags = map.iter().filter(|(st, _)| f & st != 0).fold(0, |acc, (_, ms)| acc | ms);
+    // Neither noatime nor relatime is strictatime, which a remount must ask
+    // for by name, or it gets relatime and the kernel refuses the change.
+    if f & (libc::ST_NOATIME | ST_RELATIME) == 0 {
+        flags |= libc::MS_STRICTATIME;
+    }
+    Ok(flags)
 }
 
 /// Hides what in /proc and /sys tells about, or reaches into, the host.
