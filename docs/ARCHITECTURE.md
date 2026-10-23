@@ -224,18 +224,23 @@ never collide because nothing is published on the host by default:
 
 - `ports(id)`: what listens in the berth, read from its socket table;
 - `proxy(id, port)`: one connection to that port, streamed over the API socket;
-- `socks(id)`: a SOCKS5 server on a Unix socket where `localhost` means the
-  berth's loopback. `ssh -L 127.0.0.1:N:/run/berth/berths/<id>/socks.sock`
-  makes it a local port anywhere;
-- `publish(id, port)`: optional, maps a berth port to a host port.
+- `socks(id)`: a SOCKS5 server on a Unix socket (`/run/berth/socks/<id>.sock`,
+  `root:berth`, 0660) where `localhost` means the berth's loopback; every
+  connection is opened from inside the berth, so its network rules hold.
+  `ssh -L 127.0.0.1:N:/run/berth/socks/<id>.sock` makes it a local port
+  anywhere, and `berth socks ID --listen ADDR` on the box itself;
+- `publish(id, port)`: optional, maps a berth port to a host port, kept across
+  daemon restarts. Anyone who can reach that host address reaches the port.
 
 A connection to a sleeping berth wakes it.
 
-**Secrets proxies.** At creation the caller can give: host ports the berth may
-reach, environment variables (`HTTPS_PROXY=...`) and extra CA certificates that
-the daemon installs into the berth's trust store. That's enough for Ensemble's
-secrets proxy without berth knowing about secrets. Transparent interception
-(redirecting all `:443` to a proxy) can come later.
+**Secrets proxies.** At creation the caller can give host ports the berth may
+reach on its gateway (`--host-port`): an nftables set of (berth address, port),
+so each berth reaches only its own. Environment variables come with each
+command (`exec -e HTTPS_PROXY=...`), and a CA certificate can be installed by
+the caller as the berth's root. That's enough for Ensemble's secrets proxy
+without berth knowing about secrets. Transparent interception (redirecting all
+`:443` to a proxy) can come later.
 
 ## Docker inside a berth
 
@@ -254,9 +259,11 @@ served.
 - Its networks live in the berth's network namespace: a compose service
   publishing `5432` shows up in `ports(id)` and is reachable through `proxy`
   like any other port, and two berths' Postgres never meet.
-- Pulls go through the registry mirror (designed; the tenant hook isn't wired
-  into the daemon yet, so today each berth's Docker pulls straight from the
-  registry).
+- Pulls go through the tenant's registry mirror: an ordinary berth made from
+  `registry:3` in proxy mode, its port published on the gateway, reachable by
+  that tenant's berths only. It's made with the tenant's first berth that has
+  Docker. `BERTH_REGISTRY_UPSTREAM` points it elsewhere than Docker Hub (a
+  machine whose address Docker Hub rate-limits can use `mirror.gcr.io`).
 
 Docker is the part of a berth that reaches the most kernel surface (mounts,
 namespaces, netfilter). Strict mode runs it under gVisor with the rest of the
@@ -334,36 +341,31 @@ Docker's API, so a client in any language is a few hundred lines. The CLI is a
 client of it and is what callers use over SSH.
 
 ```
-berth create   --project P --branch B [--cpus 2 --memory 4G ...] [--tenant T] [--strict]   -> id
-berth exec     ID [--tty] [--env K=V] [--dir D] [--detach] [--service NAME] -- CMD...
+berth create   [--name N] [--project P --branch B] [--layer L...] [--cpus 2 --memory 4G ...]
+               [--tenant T] [--host-port PORT...] [--idle-after 5m] [--stop-after 12h]   -> id
+berth exec     ID [-t] [-e K=V] [--dir D] [-d | --service NAME] -- CMD...
 berth ports    ID [--json]
 berth proxy    ID PORT                  # stdin/stdout <-> the berth's port
-berth socks    ID                       # prints the berth's SOCKS socket path
-berth publish  ID PORT [HOSTPORT]
-berth idle | stop | wake  ID
-berth snapshot ID [NAME]       berth restore ID NAME      berth fork ID|SNAPSHOT
+berth socks    ID [--listen ADDR]       # the berth's SOCKS socket path, or serve it on TCP
+berth publish  ID PORT [--host-port P] [--address A]      berth unpublish ID PORT
+berth idle | stop | start | trim  ID
+berth snapshot create|ls|rm ID [NAME]  berth restore ID NAME  berth fork ID [--snapshot S] [--branch B]
 berth destroy  ID
-berth ls       [--tenant T] [--json]
-berth repo add P URL           berth layer build ...      berth cache promote ...
+berth ls       [--json]
+berth repo add|ls|rm           berth layer build|commit|ls|rm      berth pull REF
 ```
+
+Wherever an ID goes, a berth's name goes too.
 
 `--tenant` groups berths for shared caches and registry mirrors; berths are
 isolated from each other whatever their tenant.
 
 ### Ensemble on top
 
-A `berth` driver for Ensemble's `sandbox.Machine` stays thin:
-
-| `sandbox.Machine` | berth |
-|---|---|
-| `Create` | `ssh box berth create ...` |
-| `Command(spec)` | `ssh -t box berth exec ID --dir D --env ... -- args` |
-| `ListeningPorts` | `berth ports ID --json` |
-| `SocksProxy(port)` | `ssh -N -L 127.0.0.1:port:<socks socket> box` |
-| `HostAddress` | the berth's gateway address, with the secrets proxy's port allowed |
-| `Destroy` | `berth destroy ID` |
-| `Pauser` | `idle` / `stop` / `wake`; `KeepsPrograms` true while idle |
-| `Inventory` | `berth ls --json`, `berth destroy` |
+A `berth` driver for Ensemble's `sandbox.Machine` stays thin: every method is
+one `berth` command, run on the box over SSH. [ensemble.md](ensemble.md) maps
+each of them, the optional interfaces too. The driver itself lives in
+Ensemble.
 
 ## What we take from prior art
 
@@ -390,13 +392,15 @@ A `berth` driver for Ensemble's `sandbox.Machine` stays thin:
 
 ## Order of work
 
-1. **Prototype**: `berthd` and `berth` with create, exec (tty, detach), ports,
-   proxy, destroy; base image plus tools layer with Claude Code; veth
+1. ✅ **Prototype**: `berthd` and `berth` with create, exec (tty, detach),
+   ports, proxy, destroy; base image plus tools layer with Claude Code; veth
    networking. Done when two berths each run Claude Code and both serve
    `:3000`, reachable through `berth proxy`, without colliding.
-2. Limits, seccomp and Landlock hardened; idle, stop, wake and services.
-3. Docker in a berth, registry mirror, caches, reflinked checkouts.
-4. Snapshots, fork, an Ensemble driver.
+2. ✅ Limits, seccomp and Landlock hardened; idle, stop, wake and services.
+3. ✅ Docker in a berth, the registry mirror. Shared package caches and
+   reflinked checkouts are still to come.
+4. ✅ Snapshots, fork, and what an Ensemble driver needs (names, host ports,
+   SOCKS); the driver itself is Ensemble's.
 5. Strict mode (gVisor).
 
 ## Open questions

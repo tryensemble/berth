@@ -26,8 +26,11 @@ Known limits, which aren't bugs to report:
 - Berths share the host's kernel. A kernel bug reachable from inside a berth
   can break the wall. Keep the kernel patched. Strict mode (gVisor) is for
   code nobody vouches for.
-- Members of the `berth` group control every berth on the machine; the group
-  is for operators, not for the agents.
+- Members of the `berth` group control every berth on the machine, and can
+  reach any berth's ports through its SOCKS socket; the group is for
+  operators, not for the agents.
+- A published port (`berth publish`) is reachable by anyone who can reach the
+  host address it's published on: 127.0.0.1 by default.
 - A berth can use its share of the machine (CPU, memory, processes, as
   limited) and the network to the internet. It can't take more, but it can
   use what it has for anything.

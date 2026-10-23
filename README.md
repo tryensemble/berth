@@ -56,6 +56,7 @@ Node:
 | Wake an idle berth | a few ms |
 | 30 berths, each running a server | ~28 MB total (~0.9 MB each) |
 | 30 berths, idle | ~16 MB total (~0.5 MB each) |
+| Snapshot, fork, restore a berth with 540 MB in 2,300 files | 0.16 s, 0.11 s, 0.30 s on XFS, no disk used; 0.24 s, 0.48 s and two full copies on ext4 |
 
 A berth reserves none of this: it costs what its own programs use. Measure
 your own with `make e2e` and `berth ls`.
@@ -87,7 +88,9 @@ machines.
 | **A smaller kernel** | A seccomp filter refuses the kernel's riskiest calls (BPF, io_uring, module loading, the keyring, ...), and `/proc` and `/sys` hide the host. |
 | **Rest when unused** | A berth nobody uses is frozen and its memory pushed out: no CPU, about a megabyte. Any use wakes it in milliseconds, with its programs where they were. After a long time unused it's stopped; it starts again in a fraction of a second. |
 | **Services** | Commands started with `--service` are kept running and started again whenever the berth starts. |
-| **Docker** | Each berth can run its own Docker (its own layer), started on first use. Containers count against the berth's limits, serve on the berth's ports, and no other berth sees them. |
+| **Docker** | Each berth can run its own Docker (its own layer), started on first use. Containers count against the berth's limits, serve on the berth's ports, and no other berth sees them. Pulls go through the tenant's registry mirror. |
+| **Snapshots and forks** | A berth's files, services and Docker state at a moment, taken while it's frozen. Restore goes back to one; fork makes a new berth from one. On XFS or btrfs they're reflinks: instant and free until something changes. |
+| **Ways in** | Its own SOCKS5 socket where `localhost` is the berth, published host ports, and host ports it may reach (a secrets proxy). |
 | **Long-running work** | Everything in a berth is a child of its init, not of the daemon: it keeps running when the daemon restarts or is upgraded. |
 
 ## Requirements
@@ -155,21 +158,27 @@ echo 1 | sudo tee /sys/module/zswap/parameters/enabled
 
 | Command | What it does |
 |---|---|
-| `berth create` | Make a berth and print its id (`--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`, `--idle-after`, `--stop-after`, `--tenant`) |
+| `berth create` | Make a berth and print its id (`--name`, `--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`, `--idle-after`, `--stop-after`, `--tenant`, `--host-port`) |
 | `berth exec ID -- CMD` | Run a command in a berth, waking it if needed (`-t` terminal, `-d` detach, `--service NAME`, `-u` user, `-e` env, `--dir`) |
 | `berth logs ID NAME` | What a detached command or service printed (`-f` to follow) |
 | `berth service ls\|rm ID` | A berth's services |
 | `berth ports ID` | The TCP ports something listens on in a berth |
 | `berth proxy ID PORT` | Connect stdin and stdout to a port in a berth, for use as an SSH `ProxyCommand` and the like |
 | `berth forward ID PORT` | Serve a berth's port on this machine's `127.0.0.1` |
+| `berth socks ID` | The berth's SOCKS5 socket, where `localhost` is the berth (`--listen ADDR` serves it on TCP) |
+| `berth publish\|unpublish ID PORT` | Serve a berth's port on a host port (`--host-port`, `--address`), kept across restarts |
 | `berth idle\|stop\|start ID...` | Freeze berths, stop them, or start them again |
+| `berth trim ID...` | Hand back a running berth's cache without freezing it |
+| `berth snapshot create\|ls\|rm ID` | A berth's files and services at a moment |
+| `berth restore ID NAME` | Put a berth back as it was in a snapshot |
+| `berth fork ID` | A new berth from a berth or one of its snapshots (`--snapshot`, `--branch`, `--name`) |
 | `berth ls` | List berths with their state and memory (`--json` for scripts) |
 | `berth destroy ID...` | Remove berths and everything in them |
 | `berth pull REF` / `berth images` | Pull an OCI image, such as `ubuntu:24.04`, to make berths from |
-| `berth layer build\|ls\|rm` | Run a script as root in a fresh berth and keep what it installed as a shared, read-only layer |
+| `berth layer build\|commit\|ls\|rm` | Keep what a script (or you, by hand) installed in a berth as a shared, read-only layer |
 | `berth repo add\|ls\|rm` | Mirror a project's repository, or fetch it again |
 
-Every command talks to the daemon at `/run/berth/berth.sock`. Set
+Wherever a command takes a berth's id, it takes its name too. Every command talks to the daemon at `/run/berth/berth.sock`. Set
 `BERTH_SOCKET` to use another socket.
 
 ## How it works
@@ -209,7 +218,10 @@ the connection to a stream with `Upgrade`, as Docker's API does.
 | `POST` | `/v1/berths` | Create a berth |
 | `GET` | `/v1/berths/{id}` | One berth |
 | `DELETE` | `/v1/berths/{id}` | Destroy a berth |
-| `POST` | `/v1/berths/{id}/start`, `/idle`, `/stop` | Change its state |
+| `POST` | `/v1/berths/{id}/start`, `/idle`, `/stop`, `/trim` | Change its state |
+| `GET`, `POST`, `DELETE` | `/v1/berths/{id}/snapshots[/{name}]` | List, take or remove snapshots |
+| `POST` | `/v1/berths/{id}/restore`, `/fork` | Restore a snapshot; fork a new berth |
+| `POST`, `DELETE` | `/v1/berths/{id}/publish[/{port}]` | Publish a port on the host, or stop |
 | `GET` | `/v1/berths/{id}/ports` | Listening ports |
 | `POST` | `/v1/berths/{id}/exec` | Run a command (upgrade; framed stdin, stdout, stderr, exit code) |
 | `POST` | `/v1/berths/{id}/proxy` | A byte stream to a port (upgrade) |
@@ -253,7 +265,7 @@ tests/
 └── e2e/           the binary against a running daemon: basics, hardening, lifecycle
 layers/             shared layers: tools (git, Node, Claude Code), docker
 dist/              the systemd unit
-docs/              architecture
+docs/              architecture, and how Ensemble drives berth
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
@@ -266,10 +278,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
    setup, Landlock around the daemon's root work. Idle, stop and wake.
    Services.
 3. **Docker inside a berth** ✅ its own dockerd, started on first use,
-   containers in the berth's cgroup and network. A registry mirror, shared
-   caches and reflinked checkouts are still to come.
-4. Snapshots and forks, and an [Ensemble](https://github.com/tryensemble)
-   driver.
+   containers in the berth's cgroup and network, pulls through its tenant's
+   registry mirror.
+4. **Snapshots and forks** ✅ consistent snapshots, restore and fork, free
+   on XFS; SOCKS sockets, published ports, names, host ports and a registry
+   mirror per tenant. What an [Ensemble](https://github.com/tryensemble) driver
+   needs is all there; [docs/ensemble.md](docs/ensemble.md) maps it.
 5. Strict mode: berths under gVisor, for code nobody vouches for.
 
 ## License
