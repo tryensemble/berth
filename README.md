@@ -91,6 +91,7 @@ machines.
 | **Docker** | Each berth can run its own Docker (its own layer), started on first use. Containers count against the berth's limits, serve on the berth's ports, and no other berth sees them. Pulls go through the tenant's registry mirror. |
 | **Snapshots and forks** | A berth's files, services and Docker state at a moment, taken while it's frozen. Restore goes back to one; fork makes a new berth from one. On XFS or btrfs they're reflinks: instant and free until something changes. |
 | **Ways in** | Its own SOCKS5 socket where `localhost` is the berth, published host ports, and host ports it may reach (a secrets proxy). |
+| **Strict mode** | `--strict` runs the berth's commands under gVisor, a user-space kernel, so a host-kernel bug reachable from inside can't break out. Everything else about the berth is unchanged. |
 | **Long-running work** | Everything in a berth is a child of its init, not of the daemon: it keeps running when the daemon restarts or is upgraded. |
 
 ## Requirements
@@ -120,6 +121,8 @@ berth pull ubuntu:24.04
 berth layer build tools layers/tools.sh
 # And Docker, for berths that run containers (started on first use in a berth).
 berth layer build docker layers/docker.sh --from tools
+# And gVisor, for strict berths (berth create --strict).
+berth layer build gvisor layers/gvisor.sh --from tools
 
 # A project, mirrored once; each berth gets its own branch of it.
 berth repo add web https://github.com/you/web
@@ -158,7 +161,7 @@ echo 1 | sudo tee /sys/module/zswap/parameters/enabled
 
 | Command | What it does |
 |---|---|
-| `berth create` | Make a berth and print its id (`--name`, `--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`, `--idle-after`, `--stop-after`, `--tenant`, `--host-port`) |
+| `berth create` | Make a berth and print its id (`--name`, `--project`, `--branch`, `--layer`, `--cpus`, `--memory`, `--pids`, `--tmp`, `--idle-after`, `--stop-after`, `--tenant`, `--host-port`, `--strict`) |
 | `berth exec ID -- CMD` | Run a command in a berth, waking it if needed (`-t` terminal, `-d` detach, `--service NAME`, `-u` user, `-e` env, `--dir`) |
 | `berth logs ID NAME` | What a detached command or service printed (`-f` to follow) |
 | `berth service ls\|rm ID` | A berth's services |
@@ -263,7 +266,7 @@ src/
 tests/
 ├── cli.rs         the binary without a daemon
 └── e2e/           the binary against a running daemon: basics, hardening, lifecycle
-layers/             shared layers: tools (git, Node, Claude Code), docker
+layers/             shared layers: tools (git, Node, Claude Code), docker, gvisor
 dist/              the systemd unit
 docs/              architecture, and how Ensemble drives berth
 ```
@@ -284,8 +287,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
    on XFS; SOCKS sockets, published ports, names, host ports and a registry
    mirror per tenant. What an [Ensemble](https://github.com/tryensemble) driver
    needs is all there; [docs/ensemble.md](docs/ensemble.md) maps it.
-5. Strict mode: berths under gVisor, for code nobody vouches for (feasibility
-   verified; the backend is the next piece of work).
+5. **Strict mode** ✅ `--strict` runs a berth's commands under gVisor; a
+   command's syscalls reach the gVisor sentry, not the host kernel, while
+   ports, SOCKS, idle/wake and the rest are unchanged.
 
 ## License
 

@@ -66,6 +66,9 @@ not on the host's own computer.
   in a fraction of a second on XFS.
 - **Docker.** A berth with the Docker layer has its own Docker, pulling through
   its tenant's registry mirror (`--tenant`, one per Ensemble account, say).
+- **Strict mode.** `berth create --strict` (with the gvisor layer) runs the
+  thread's commands under gVisor, for code nobody vouches for; the driver
+  needn't do anything else differently.
 
 ## Errors
 

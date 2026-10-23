@@ -23,9 +23,10 @@ end-to-end tests in [tests/e2e](tests/e2e) try these walls from inside a berth.
 
 Known limits, which aren't bugs to report:
 
-- Berths share the host's kernel. A kernel bug reachable from inside a berth
-  can break the wall. Keep the kernel patched. Strict mode (gVisor) is for
-  code nobody vouches for.
+- By default berths share the host's kernel, so a kernel bug reachable from
+  inside a berth can break the wall; keep the kernel patched. A berth made
+  `--strict` runs its commands under gVisor, a user-space kernel, which closes
+  that gap for code nobody vouches for, at some cost to speed.
 - Members of the `berth` group control every berth on the machine, and can
   reach any berth's ports through its SOCKS socket; the group is for
   operators, not for the agents.

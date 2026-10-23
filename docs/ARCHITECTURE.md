@@ -45,12 +45,27 @@ berth's answer, in order:
    kernel's riskiest calls, no real root, no host devices, no kernel modules,
    no BPF, no io_uring.
 2. Keep the computer's kernel patched (Ubuntu's livepatch where available).
-3. A **strict** mode per berth for when that isn't enough: the same berth, run
-   under gVisor, a user-space kernel that sits between the berth's programs and
-   the real kernel. It still reserves nothing and starts in milliseconds (a
+3. A **strict** mode per berth for when that isn't enough: the same berth, its
+   commands run under gVisor (`runsc`), a user-space kernel that sits between
+   the berth's programs and the real kernel. A command's syscalls are served
+   by the gVisor sentry, so a host-kernel bug reachable from inside the berth
+   no longer is. It still reserves nothing and starts in milliseconds (a
    workload runs under its kernel in about 70 ms, measured); it costs some
-   speed on file-heavy work (installs, builds). It's an option per
-   berth, behind the `Sandbox` trait, not part of the first prototype.
+   speed on file-heavy work (installs, builds).
+
+   Strict mode changes only how a command runs, not what a berth is: the
+   berth's namespaces, overlay root, network, cgroup, ports, SOCKS, idle and
+   services are all as below. Init, instead of exec-ing a command directly,
+   runs it under `runsc` over a shared bind of the berth's root, in the berth's
+   own network namespace (`--network=host`, so its ports and `proxy` reach a
+   server under gVisor), writing straight through the berth's overlay
+   (`--overlay2=none`, since the berth already provides copy-on-write), with
+   the berth's seccomp filter still around `runsc` itself. It's `berth create
+   --strict`, and needs the gvisor layer (`layers/gvisor.sh`), which brings
+   `runsc` from gVisor's GitHub release, verified against its SHA512SUMS. A
+   strict berth with no `runsc` refuses to start rather than run a command
+   unprotected. A command gets an `isatty()` terminal but not yet a
+   controlling tty (enough for Claude Code); full job control is future work.
 
 ## Processes
 
@@ -343,7 +358,7 @@ client of it and is what callers use over SSH.
 
 ```
 berth create   [--name N] [--project P --branch B] [--layer L...] [--cpus 2 --memory 4G ...]
-               [--tenant T] [--host-port PORT...] [--idle-after 5m] [--stop-after 12h]   -> id
+               [--tenant T] [--host-port PORT...] [--idle-after 5m] [--stop-after 12h] [--strict]   -> id
 berth exec     ID [-t] [-e K=V] [--dir D] [-d | --service NAME] -- CMD...
 berth ports    ID [--json]
 berth proxy    ID PORT                  # stdin/stdout <-> the berth's port
