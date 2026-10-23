@@ -28,16 +28,33 @@ pub fn isolated(tree: &OwnedFd, userns: &OwnedFd, blob: &Path, gzip: bool) -> an
     }
     cmd.env_clear().stdin(File::open(blob)?).stdout(Stdio::null()).stderr(Stdio::piped());
     unsafe {
+        let parent = libc::getpid();
         cmd.pre_exec(move || {
-            sys::cvt(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
             sys::setns(u, libc::CLONE_NEWUSER)?;
             // Become the namespace's root (the first unpack id): host root
             // isn't mapped in it, and an unmapped uid execs without caps.
             sys::cvt(libc::setgroups(0, std::ptr::null()))?;
             sys::cvt(libc::setresgid(0, 0, 0))?;
             sys::cvt(libc::setresuid(0, 0, 0))?;
-            sys::cvt(libc::unshare(libc::CLONE_NEWNET))?;
-            // The tree's fd, kept across exec for this child alone.
+            // After the change of ids, which would clear it: die with the
+            // daemon, and don't start if it's gone already.
+            sys::cvt(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
+            if libc::getppid() != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            // Nothing of the host's but the tree: no network, IPC, mounts,
+            // hostname or cgroup view.
+            let alone = libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWNS | libc::CLONE_NEWUTS;
+            sys::cvt(libc::unshare(alone | libc::CLONE_NEWCGROUP))?;
+            // No fd the daemon holds reaches it, but the tree's.
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            let cloexec = |from: i32, to: libc::c_uint| {
+                libc::syscall(libc::SYS_close_range, from as libc::c_uint, to, CLOSE_RANGE_CLOEXEC)
+            };
+            if t > 3 {
+                cloexec(3, t as libc::c_uint - 1);
+            }
+            cloexec(t + 1, libc::c_uint::MAX);
             sys::cvt(libc::fcntl(t, libc::F_SETFD, 0))?;
             Ok(())
         });
@@ -58,6 +75,10 @@ pub fn child(tree_fd: i32, gzip: bool) -> anyhow::Result<()> {
     sys::cvt(unsafe { libc::chroot(c".".as_ptr()) })?;
     std::env::set_current_dir("/")?;
     drop(tree);
+    // One process, no core dumps.
+    for (res, n) in [(libc::RLIMIT_NPROC, 1), (libc::RLIMIT_CORE, 0)] {
+        sys::cvt(unsafe { libc::setrlimit(res, &libc::rlimit { rlim_cur: n, rlim_max: n }) })?;
+    }
     sys::cvt(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
     seccomp::install(&seccomp::program())?;
     unpack_layer(unsafe { File::from_raw_fd(0) }, Path::new("/"), gzip)
@@ -70,7 +91,8 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
     let reader: Box<dyn Read> = if gzip { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(true);
+    // Owners are set below, kept within the ids a berth has.
+    archive.set_preserve_ownerships(false);
     // Extended attributes are set below, only the ones an image may carry.
     archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
@@ -95,16 +117,46 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
             }
             continue;
         }
+        // A link to something left out (a device node) is left out too.
+        if kind.is_hard_link()
+            && let Some(target) = entry.link_name()?
+            && fs::symlink_metadata(root.join(&target)).is_err()
+        {
+            continue;
+        }
+        let h = entry.header();
+        let (uid, gid, mode) = (owner_id(h.uid()?), owner_id(h.gid()?), h.mode()?);
         let xattrs = xattrs_of(&mut entry)?;
         if entry.unpack_in(root)? {
-            set_xattrs(&root.join(&path), &xattrs);
+            let dest = root.join(&path);
+            if !kind.is_hard_link() {
+                own(&dest, uid, gid, (!kind.is_symlink()).then_some(mode))?;
+            }
+            set_xattrs(&dest, &xattrs);
         }
     }
     Ok(())
 }
 
+/// The id a file gets for an owner an image gave it: as given if a berth has
+/// it (0..65536), else nobody's, as a kernel shows ids it can't map.
+fn owner_id(id: u64) -> u32 {
+    if id < 65536 { id as u32 } else { 65534 }
+}
+
+/// Gives path (itself, not what a link there points to) its owners, then its
+/// mode again, since a change of owner clears setuid and setgid bits.
+fn own(path: &Path, uid: u32, gid: u32, mode: Option<u32>) -> io::Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))?;
+    }
+    Ok(())
+}
+
 /// The extended attributes an entry carries that an image may set: file
-/// capabilities (ping's, say) and the user namespace's own. Not trusted.*,
+/// capabilities (ping's, say) and user.* ones. Not trusted.* or user.overlay.*,
 /// which overlayfs reads its own state from, nor security labels.
 fn xattrs_of<R: Read>(entry: &mut tar::Entry<R>) -> io::Result<Vec<(CString, Vec<u8>)>> {
     let mut v = Vec::new();
@@ -112,7 +164,10 @@ fn xattrs_of<R: Read>(entry: &mut tar::Entry<R>) -> io::Result<Vec<(CString, Vec
     for ext in exts {
         let ext = ext?;
         let Some(name) = ext.key_bytes().strip_prefix(b"SCHILY.xattr.") else { continue };
-        if (name == b"security.capability" || name.starts_with(b"user."))
+        let wanted = name == b"security.capability" || name.starts_with(b"user.");
+        // An overlay mounted in a user namespace reads its own state from these.
+        if wanted
+            && !name.starts_with(b"user.overlay.")
             && let Ok(name) = CString::new(name)
         {
             v.push((name, ext.value_bytes().to_vec()));
@@ -308,5 +363,51 @@ mod tests {
         assert!(fs::symlink_metadata(root.path().join("disk")).is_err());
         assert!(fs::symlink_metadata(root.path().join("mem")).is_err());
         assert_eq!(fs::read_to_string(root.path().join("kept")).unwrap(), "ok");
+    }
+
+    /// One pax record, `<len> <key>=<value>\n`, its length counting itself.
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body = [key.as_bytes(), b"=", value, b"\n"].concat();
+        let mut len = body.len() + 2;
+        while format!("{len} ").len() + body.len() != len {
+            len += 1;
+        }
+        [format!("{len} ").into_bytes(), body].concat()
+    }
+
+    #[test]
+    fn only_harmless_xattrs_are_taken() {
+        let records = [
+            pax_record("SCHILY.xattr.security.capability", b"\x01\x00\x00\x02"),
+            pax_record("SCHILY.xattr.user.mime", b"text/plain"),
+            pax_record("SCHILY.xattr.user.overlay.opaque", b"y"),
+            pax_record("SCHILY.xattr.trusted.overlay.redirect", b"/etc"),
+            pax_record("SCHILY.xattr.security.selinux", b"system_u"),
+        ]
+        .concat();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut x = header();
+        x.set_entry_type(tar::EntryType::XHeader);
+        x.set_size(records.len() as u64);
+        b.append_data(&mut x, "pax", &records[..]).unwrap();
+        let mut h = header();
+        h.set_mode(0o755);
+        h.set_size(0);
+        b.append_data(&mut h, "bin/ping", io::empty()).unwrap();
+        let data = b.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(&data[..]);
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let names: Vec<String> =
+            xattrs_of(&mut entry).unwrap().into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        assert_eq!(names, ["security.capability", "user.mime"]);
+    }
+
+    #[test]
+    fn owners_stay_within_a_berths_ids() {
+        assert_eq!(owner_id(0), 0);
+        assert_eq!(owner_id(65535), 65535);
+        assert_eq!(owner_id(65536), 65534);
+        assert_eq!(owner_id(1 << 40), 65534);
     }
 }
