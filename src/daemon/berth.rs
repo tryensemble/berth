@@ -50,6 +50,9 @@ pub struct CreateSpec {
     /// Host ports the berth may reach on its gateway (a secrets proxy, say).
     #[serde(default)]
     pub host_ports: Vec<u16>,
+    /// Run the berth's commands under gVisor.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// How long a berth may go unused before it's frozen, and before it's stopped.
@@ -133,6 +136,8 @@ pub struct Berth {
     /// The gateway port of its tenant's registry mirror, when it has Docker.
     #[serde(default)]
     pub registry: Option<u16>,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 fn default_idle_after() -> u64 {
@@ -265,7 +270,7 @@ mod tests {
         assert_eq!(spec.image, "ubuntu:24.04");
         assert_eq!((spec.cpus, spec.memory.as_str(), spec.pids, spec.tmp.as_str()), (2.0, "4G", 4096, "1G"));
         assert!(spec.layers.is_empty() && spec.project.is_none());
-        assert!(spec.host_ports.is_empty() && spec.name.is_none());
+        assert!(spec.host_ports.is_empty() && spec.name.is_none() && !spec.strict);
     }
 
     #[test]

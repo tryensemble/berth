@@ -35,14 +35,15 @@ pub fn run(spec: ExecSpec, stream: UnixStream, frames: Frames, reaper: Reaper) -
 /// /var/log/berth/<name>.log.
 pub fn spawn_detached(spec: &ExecSpec, reaper: &Reaper) -> anyhow::Result<(Child, mpsc::Receiver<i32>)> {
     let name = spec.service.as_deref().or(spec.name.as_deref()).unwrap_or("detached");
-    let (mut cmd, user) = command_for(spec)?;
+    let r = resolve(spec)?;
+    let mut cmd = build(&r)?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW)
         .open(format!("/var/log/berth/{}.log", name.replace('/', "_")))?;
-    unsafe { libc::fchown(log.as_raw_fd(), user.uid, user.gid) };
+    unsafe { libc::fchown(log.as_raw_fd(), r.uid, r.gid) };
     cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     unsafe {
         cmd.pre_exec(|| {
@@ -53,13 +54,45 @@ pub fn spawn_detached(spec: &ExecSpec, reaper: &Reaper) -> anyhow::Result<(Child
     Ok(reaper.spawn(&mut cmd)?)
 }
 
-fn command(spec: &ExecSpec) -> anyhow::Result<Command> {
-    Ok(command_for(spec)?.0)
+/// A command resolved to exactly what should run: the program and its
+/// arguments, who as, where, and with what environment.
+pub struct Resolved {
+    pub argv: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub strict: bool,
 }
 
-/// The command spec describes, as its user, in its directory, with the
-/// berth's environment under the caller's.
-fn command_for(spec: &ExecSpec) -> anyhow::Result<(Command, passwd::User)> {
+fn command(spec: &ExecSpec) -> anyhow::Result<Command> {
+    build(&resolve(spec)?)
+}
+
+/// The command for r: run directly, or under gVisor when the berth is strict.
+fn build(r: &Resolved) -> anyhow::Result<Command> {
+    if r.strict {
+        return super::strict::command(r);
+    }
+    let mut cmd = Command::new(&r.argv[0]);
+    cmd.args(&r.argv[1..]).env_clear().envs(r.env.iter().filter_map(|kv| kv.split_once('='))).current_dir(&r.cwd);
+    // std would drop supplementary groups; the agent needs its own (sudo,
+    // docker), so the credentials are set here instead.
+    let (uid, gid, groups) = (r.uid, r.gid, r.groups.clone());
+    unsafe {
+        cmd.pre_exec(move || {
+            sys::cvt(libc::setgroups(groups.len(), groups.as_ptr()))?;
+            sys::cvt(libc::setresgid(gid, gid, gid))?;
+            sys::cvt(libc::setresuid(uid, uid, uid))?;
+            Ok(())
+        });
+    }
+    Ok(cmd)
+}
+
+/// Resolves spec against the berth's users and defaults.
+fn resolve(spec: &ExecSpec) -> anyhow::Result<Resolved> {
     if spec.argv.is_empty() {
         bail!("no command");
     }
@@ -69,44 +102,47 @@ fn command_for(spec: &ExecSpec) -> anyhow::Result<(Command, passwd::User)> {
         .unwrap_or_else(|| if passwd::lookup("agent").is_some() { "agent".into() } else { "root".into() });
     let user = passwd::lookup(&wanted).with_context(|| format!("no user {wanted} in the berth"))?;
 
-    let mut cmd = Command::new(&spec.argv[0]);
-    cmd.args(&spec.argv[1..]).env_clear();
     let path = if user.uid == 0 {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
     } else {
         format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin", user.home)
     };
-    cmd.env("PATH", path)
-        .env("HOME", &user.home)
-        .env("USER", &user.name)
-        .env("LOGNAME", &user.name)
-        .env("SHELL", &user.shell)
-        .env("LANG", "C.UTF-8");
+    let mut env = vec![
+        format!("PATH={path}"),
+        format!("HOME={}", user.home),
+        format!("USER={}", user.name),
+        format!("LOGNAME={}", user.name),
+        format!("SHELL={}", user.shell),
+        "LANG=C.UTF-8".to_string(),
+    ];
     if spec.tty {
-        cmd.env("TERM", "xterm-256color");
+        env.push("TERM=xterm-256color".into());
     }
+    // The caller's own settings go last, so they win.
     for kv in &spec.env {
-        if let Some((k, v)) = kv.split_once('=') {
-            cmd.env(k, v);
+        if kv.contains('=') {
+            let key = kv.split('=').next().unwrap();
+            env.retain(|e| !e.starts_with(&format!("{key}=")));
+            env.push(kv.clone());
         }
     }
     let cwd = spec.cwd.clone().unwrap_or_else(|| {
         if Path::new("/workspace/.git").exists() || user.uid != 0 { "/workspace".into() } else { "/".into() }
     });
-    cmd.current_dir(&cwd);
+    Ok(Resolved {
+        argv: spec.argv.clone(),
+        env,
+        cwd,
+        uid: user.uid,
+        gid: user.gid,
+        groups: passwd::groups(&user),
+        strict: strict_mode(),
+    })
+}
 
-    // std would drop supplementary groups; the agent needs its own (sudo,
-    // docker), so the credentials are set here instead.
-    let (uid, gid, groups) = (user.uid, user.gid, passwd::groups(&user));
-    unsafe {
-        cmd.pre_exec(move || {
-            sys::cvt(libc::setgroups(groups.len(), groups.as_ptr()))?;
-            sys::cvt(libc::setresgid(gid, gid, gid))?;
-            sys::cvt(libc::setresuid(uid, uid, uid))?;
-            Ok(())
-        });
-    }
-    Ok((cmd, user))
+/// Whether this berth runs commands under gVisor.
+fn strict_mode() -> bool {
+    std::env::var("BERTH_STRICT").is_ok_and(|v| v == "1")
 }
 
 fn exit_after(frames: &Frames, rx: mpsc::Receiver<i32>, outputs: mpsc::Receiver<()>, n: usize) -> anyhow::Result<()> {

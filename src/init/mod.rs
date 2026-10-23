@@ -11,6 +11,7 @@ mod passwd;
 mod reaper;
 mod rootfs;
 mod services;
+mod strict;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -44,6 +45,9 @@ pub struct InitConfig {
     pub binds: Vec<Bind>,
     #[serde(default)]
     pub docker: docker::DockerConfig,
+    /// Run the berth's commands under gVisor.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// A host directory mounted in the berth.
@@ -86,6 +90,11 @@ fn pid1(cfg: InitConfig) -> anyhow::Result<()> {
     rootfs::build_root(&cfg).context("building the berth's filesystem")?;
     let host = std::ffi::CString::new(cfg.hostname.clone())?;
     sys::cvt(unsafe { libc::sethostname(host.as_ptr(), cfg.hostname.len()) })?;
+    if cfg.strict {
+        // exec reads this to run commands under gVisor.
+        unsafe { std::env::set_var("BERTH_STRICT", "1") };
+        strict::setup().context("setting up strict mode")?;
+    }
 
     println!("ready");
     std::io::stdout().flush()?;

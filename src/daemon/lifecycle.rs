@@ -69,6 +69,7 @@ impl Daemon {
             name: spec.name.clone(),
             host_ports: spec.host_ports.iter().copied().chain(registry).collect(),
             registry,
+            strict: spec.strict,
         })?;
         let lock = self.lock_of(&b.id);
         let _held = lock.lock().unwrap();
@@ -189,6 +190,7 @@ impl Daemon {
             tmp_size: b.limits.tmp.clone(),
             binds: self.binds(b),
             docker: crate::init::docker::DockerConfig { registry_mirror: b.registry.map(super::registry::url) },
+            strict: b.strict,
         };
         let userns = new_userns(b.uid_base)?;
         let (pid, mut go, mut out) = spawn_init(b, &cfg, &userns, &listener)?;

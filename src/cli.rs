@@ -67,6 +67,9 @@ pub enum Cmd {
         /// A host port the berth may reach on its gateway, 10.200.0.1 (repeatable)
         #[arg(long = "host-port")]
         host_ports: Vec<u16>,
+        /// Run its commands under gVisor (needs the gvisor layer)
+        #[arg(long)]
+        strict: bool,
     },
     /// Run a command in a berth, starting the berth if it's idle or stopped
     Exec {
@@ -333,6 +336,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             tenant,
             name,
             host_ports,
+            strict,
         } => {
             let v = api.json(
                 "POST",
@@ -341,7 +345,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                     "project": project, "branch": branch, "image": image, "layers": layers,
                     "cpus": cpus, "memory": memory, "pids": pids, "tmp": tmp,
                     "idle_after": idle_after, "stop_after": stop_after, "tenant": tenant,
-                    "name": name, "host_ports": host_ports,
+                    "name": name, "host_ports": host_ports, "strict": strict,
                 })),
             )?;
             println!("{}", v["id"].as_str().unwrap_or(""));
