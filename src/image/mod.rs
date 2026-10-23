@@ -6,7 +6,8 @@ mod registry;
 mod unpack;
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -15,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 pub use reference::Reference;
 use registry::{MANIFEST_TYPES, Registry, arch};
+pub use unpack::child as unpack_child;
 
 /// Where reference's root filesystem is kept under images.
 pub fn rootfs(images: &Path, reference: &str) -> PathBuf {
@@ -23,9 +25,12 @@ pub fn rootfs(images: &Path, reference: &str) -> PathBuf {
 
 /// Pulls reference into `images/<key>/rootfs`, unless it's there already.
 ///
-/// Unpacking runs as root over what a registry sent, so it runs in a thread
-/// that may write only into that image's directory.
-pub fn pull(images: &Path, reference: &str) -> anyhow::Result<PathBuf> {
+/// What a registry sent is handled with as little power as possible: it's
+/// downloaded in a thread that may write only into the image's directory, and
+/// each layer is unpacked by its own process (see [`unpack::isolated`]), as
+/// the unprivileged ids userns maps to, with what it writes shifted back to
+/// ids from 0 on the way to disk.
+pub fn pull(images: &Path, reference: &str, userns: &OwnedFd) -> anyhow::Result<PathBuf> {
     // One pull at a time: two of the same image would share a directory.
     static PULLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = PULLING.lock().unwrap_or_else(|e| e.into_inner());
@@ -36,13 +41,50 @@ pub fn pull(images: &Path, reference: &str) -> anyhow::Result<PathBuf> {
         return Ok(root);
     }
     fs::create_dir_all(&dir)?;
-    let reference = reference.to_string();
-    let target = dir.clone();
-    crate::sys::landlock::confined(&[&dir], move || pull_into(&target, &r, &reference))
+    let (reference, target) = (reference.to_string(), dir.clone());
+    let fetched = crate::sys::landlock::confined(&[&dir], move || fetch(&target, &r, &reference));
+    let Ok((manifest, layers)) = fetched else {
+        remove_blobs(&dir);
+        return fetched.map(|_| root);
+    };
+
+    let tmp = dir.join("rootfs.partial");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let unpacked = (|| -> anyhow::Result<()> {
+        let tree =
+            crate::sys::idmapped_tree(&tmp, userns.as_raw_fd(), false).context("mounting the image to unpack")?;
+        for layer in &layers {
+            unpack::isolated(&tree, userns, &layer.blob, layer.gzip)
+                .with_context(|| format!("unpacking {}", layer.digest))?;
+        }
+        Ok(())
+    })();
+    remove_blobs(&dir);
+    unpacked?;
+    fs::rename(&tmp, &root)?;
+    fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(root)
 }
 
-fn pull_into(dir: &Path, r: &Reference, reference: &str) -> anyhow::Result<PathBuf> {
-    let root = dir.join("rootfs");
+/// Removes the downloaded layers in dir.
+fn remove_blobs(dir: &Path) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with("blob") {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// A layer downloaded and checked against its digest.
+struct Layer {
+    digest: String,
+    blob: PathBuf,
+    gzip: bool,
+}
+
+/// Fetches reference's manifest and its layers' blobs into dir.
+fn fetch(dir: &Path, r: &Reference, reference: &str) -> anyhow::Result<(Value, Vec<Layer>)> {
     let mut reg = Registry::default();
     let base = format!("https://{}/v2/{}", r.host(), r.repo);
 
@@ -56,19 +98,15 @@ fn pull_into(dir: &Path, r: &Reference, reference: &str) -> anyhow::Result<PathB
             .to_string();
         manifest = reg.get(&format!("{base}/manifests/{digest}"), MANIFEST_TYPES)?.into_json()?;
     }
-    let layers = manifest["layers"].as_array().context("manifest without layers")?.clone();
-
-    let tmp = dir.join("rootfs.partial");
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp)?;
-    for layer in layers {
-        let digest = layer["digest"].as_str().context("layer without digest")?;
+    let mut layers = Vec::new();
+    for (i, layer) in manifest["layers"].as_array().context("manifest without layers")?.iter().enumerate() {
+        let digest = layer["digest"].as_str().context("layer without digest")?.to_string();
         let media = layer["mediaType"].as_str().unwrap_or("");
         if media.contains("zstd") {
             bail!("zstd layers aren't supported yet ({digest})");
         }
-        let blob = dir.join("blob");
-        let mut file = File::options().create(true).truncate(true).read(true).write(true).open(&blob)?;
+        let blob = dir.join(format!("blob{i}"));
+        let mut file = File::create(&blob)?;
         let mut resp = reg.get(&format!("{base}/blobs/{digest}"), "*/*")?.into_reader();
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 1 << 20];
@@ -84,11 +122,7 @@ fn pull_into(dir: &Path, r: &Reference, reference: &str) -> anyhow::Result<PathB
         if got != digest {
             bail!("layer {digest} arrived as {got}");
         }
-        file.rewind()?;
-        unpack::unpack_layer(file, &tmp, media.contains("gzip")).with_context(|| format!("unpacking {digest}"))?;
-        fs::remove_file(&blob)?;
+        layers.push(Layer { digest, blob, gzip: media.contains("gzip") });
     }
-    fs::rename(&tmp, &root)?;
-    fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
-    Ok(root)
+    Ok((manifest, layers))
 }

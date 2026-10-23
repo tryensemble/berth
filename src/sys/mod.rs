@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub use fd::{recv_with_fd, send_with_fd, setns};
-pub use mount::{idmapped_bind, mount, umount};
+pub use mount::{idmapped_bind, idmapped_tree, mount, umount};
 
 /// Turns a libc `-1` into the last OS error.
 pub fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {

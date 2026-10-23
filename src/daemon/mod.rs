@@ -32,10 +32,18 @@ use routes::Route;
 
 pub use spawn::hold;
 
+/// Pulls an image, unpacking it as the unpack ids.
+fn pull_image(reference: &str) -> anyhow::Result<std::path::PathBuf> {
+    image::pull(&paths::state("images"), reference, &spawn::new_userns(UNPACK_UID)?)
+}
+
 /// Each berth's user namespace maps its ids 0..65536 to a host range of its own,
 /// starting here.
 const UID_START: u32 = 1_000_000;
 const UID_COUNT: u32 = 65536;
+/// Image layers are unpacked as these ids (UID_COUNT of them), which own
+/// nothing anywhere: below the berths' ranges and the fetch uid's.
+const UNPACK_UID: u32 = UID_START - 2 * UID_COUNT;
 /// The berth user agents run as.
 const AGENT_UID: u32 = 1000;
 
@@ -338,7 +346,7 @@ impl Daemon {
             }
             Route::PullImage => {
                 let reference = body["reference"].as_str().context("reference missing")?;
-                let root = image::pull(&paths::state("images"), reference)?;
+                let root = pull_image(reference)?;
                 json!({ "reference": reference, "rootfs": root })
             }
             Route::Images => json!(store::list(&paths::state("images"), |p| p.join("rootfs").is_dir())),

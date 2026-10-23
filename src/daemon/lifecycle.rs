@@ -25,7 +25,7 @@ impl Daemon {
     pub fn create(&self, spec: CreateSpec, registry: Option<u16>) -> anyhow::Result<Berth> {
         let image_root = image::rootfs(&paths::state("images"), &spec.image);
         if !image_root.exists() {
-            image::pull(&paths::state("images"), &spec.image)?;
+            super::pull_image(&spec.image)?;
         }
         for l in &spec.layers {
             if !valid_name(l) || !paths::state("layers").join(l).is_dir() {

@@ -1,8 +1,67 @@
-//! Unpacking image layers, with OCI whiteouts.
+//! Unpacking image layers, with OCI whiteouts, in a process of their own.
 
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::bail;
+
+use crate::sys::{self, seccomp};
+
+/// Unpacks the layer in blob into tree, an idmapped mount of the image's
+/// root (see [`sys::idmapped_tree`]), in a process that can do nothing else.
+/// It runs as the unprivileged ids userns maps to, which own nothing on the
+/// host, with no network, under no_new_privs and the berth's own seccomp
+/// filter, chrooted into the tree: a link or path in the layer has nowhere to
+/// lead, and a bug in the tar or gzip code has nothing to reach.
+pub fn isolated(tree: &OwnedFd, userns: &OwnedFd, blob: &Path, gzip: bool) -> anyhow::Result<()> {
+    let (t, u) = (tree.as_raw_fd(), userns.as_raw_fd());
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg0("berth-unpack").args(["__unpack", "--tree-fd", &t.to_string()]);
+    if gzip {
+        cmd.arg("--gzip");
+    }
+    cmd.env_clear().stdin(File::open(blob)?).stdout(Stdio::null()).stderr(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(move || {
+            sys::cvt(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
+            sys::setns(u, libc::CLONE_NEWUSER)?;
+            // Become the namespace's root (the first unpack id): host root
+            // isn't mapped in it, and an unmapped uid execs without caps.
+            sys::cvt(libc::setgroups(0, std::ptr::null()))?;
+            sys::cvt(libc::setresgid(0, 0, 0))?;
+            sys::cvt(libc::setresuid(0, 0, 0))?;
+            sys::cvt(libc::unshare(libc::CLONE_NEWNET))?;
+            // The tree's fd, kept across exec for this child alone.
+            sys::cvt(libc::fcntl(t, libc::F_SETFD, 0))?;
+            Ok(())
+        });
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        bail!("{}", msg.trim().trim_start_matches("berth: "));
+    }
+    Ok(())
+}
+
+/// The unpacking process, from [`isolated`]: confines itself, then unpacks
+/// the layer on stdin into the tree at tree_fd.
+pub fn child(tree_fd: i32, gzip: bool) -> anyhow::Result<()> {
+    let tree = unsafe { OwnedFd::from_raw_fd(tree_fd) };
+    sys::cvt(unsafe { libc::fchdir(tree.as_raw_fd()) })?;
+    sys::cvt(unsafe { libc::chroot(c".".as_ptr()) })?;
+    std::env::set_current_dir("/")?;
+    drop(tree);
+    sys::cvt(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
+    seccomp::install(&seccomp::program())?;
+    unpack_layer(unsafe { File::from_raw_fd(0) }, Path::new("/"), gzip)
+}
 
 /// Unpacks a layer tarball over root. `.wh.<name>` removes name from the
 /// layers below; `.wh..wh..opq` empties its directory first. Device nodes are
@@ -12,7 +71,8 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
-    archive.set_unpack_xattrs(true);
+    // Extended attributes are set below, only the ones an image may carry.
+    archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -35,9 +95,39 @@ pub fn unpack_layer(file: File, root: &Path, gzip: bool) -> anyhow::Result<()> {
             }
             continue;
         }
-        entry.unpack_in(root)?;
+        let xattrs = xattrs_of(&mut entry)?;
+        if entry.unpack_in(root)? {
+            set_xattrs(&root.join(&path), &xattrs);
+        }
     }
     Ok(())
+}
+
+/// The extended attributes an entry carries that an image may set: file
+/// capabilities (ping's, say) and the user namespace's own. Not trusted.*,
+/// which overlayfs reads its own state from, nor security labels.
+fn xattrs_of<R: Read>(entry: &mut tar::Entry<R>) -> io::Result<Vec<(CString, Vec<u8>)>> {
+    let mut v = Vec::new();
+    let Some(exts) = entry.pax_extensions()? else { return Ok(v) };
+    for ext in exts {
+        let ext = ext?;
+        let Some(name) = ext.key_bytes().strip_prefix(b"SCHILY.xattr.") else { continue };
+        if (name == b"security.capability" || name.starts_with(b"user."))
+            && let Ok(name) = CString::new(name)
+        {
+            v.push((name, ext.value_bytes().to_vec()));
+        }
+    }
+    Ok(v)
+}
+
+/// Sets xattrs on path itself, not on what a link there points to. One that
+/// won't set (a filesystem without user xattrs) is left off, as Docker does.
+fn set_xattrs(path: &Path, xattrs: &[(CString, Vec<u8>)]) {
+    let Ok(p) = CString::new(path.as_os_str().as_bytes()) else { return };
+    for (name, value) in xattrs {
+        unsafe { libc::lsetxattr(p.as_ptr(), name.as_ptr(), value.as_ptr() as *const _, value.len(), 0) };
+    }
 }
 
 /// root/rel with its symlinks resolved, if that's a directory inside root.
