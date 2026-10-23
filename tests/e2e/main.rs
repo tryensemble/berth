@@ -82,7 +82,7 @@ pub fn layer() -> &'static str {
         &CELL,
         "set -e
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends ca-certificates git sudo >/dev/null
+        apt-get install -y -qq --no-install-recommends ca-certificates git sudo iproute2 >/dev/null
         userdel -r ubuntu 2>/dev/null || true
         useradd -m -u 1000 -s /bin/bash agent
         echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent

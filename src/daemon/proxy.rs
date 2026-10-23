@@ -103,6 +103,12 @@ impl Daemon {
             eprintln!("berthd: berth {id}: SOCKS socket: {e:#}");
         }
         let Ok(b) = self.get(id) else { return };
+        // The bridge rules were reloaded when the daemon started.
+        if b.alive()
+            && let Err(e) = crate::net::sender(b.n, true)
+        {
+            eprintln!("berthd: berth {id}: its address on the bridge: {e:#}");
+        }
         for port in &b.host_ports {
             if let Err(e) = crate::net::host_access(crate::net::address(b.n), *port, true) {
                 eprintln!("berthd: berth {id}: host port {port}: {e:#}");

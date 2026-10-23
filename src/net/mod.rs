@@ -24,6 +24,7 @@ pub fn setup_host() -> anyhow::Result<()> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
 
     let _ = run("nft", &["delete", "table", "inet", "berth"]);
+    let _ = run("nft", &["delete", "table", "bridge", "berth"]);
     let mut nft = std::process::Command::new("nft").args(["-f", "-"]).stdin(std::process::Stdio::piped()).spawn()?;
     use std::io::Write;
     nft.stdin.take().unwrap().write_all(RULES.as_bytes())?;
@@ -94,6 +95,7 @@ pub fn attach(n: u32, pid: i32) -> anyhow::Result<()> {
     run("ip", &["link", "add", &host, "type", "veth", "peer", "name", &peer])?;
     run("ip", &["link", "set", &peer, "netns", &pid.to_string()])?;
     run("ip", &["link", "set", &host, "master", BRIDGE])?;
+    sender(n, true)?;
     run("ip", &["link", "set", &host, "up"])?;
     run("bridge", &["link", "set", "dev", &host, "isolated", "on"])?;
 
@@ -122,6 +124,15 @@ pub fn host_access(address: Ipv4Addr, port: u16, allowed: bool) -> anyhow::Resul
 
 pub fn detach(n: u32) {
     let _ = run("ip", &["link", "del", &host_veth(n)]);
+    let _ = sender(n, false);
+}
+
+/// Lets berth n's port carry its own address, and only that, or stops it.
+pub fn sender(n: u32, allowed: bool) -> anyhow::Result<()> {
+    let element = format!("{{ \"{}\" . {} }}", host_veth(n), address(n));
+    let verb = if allowed { "add" } else { "delete" };
+    let r = run("nft", &[verb, "element", "bridge", "berth", "senders", &element]);
+    if allowed { r.map(drop) } else { Ok(()) }
 }
 
 /// Public resolvers for berths: the host's own, minus private addresses berths
@@ -227,7 +238,10 @@ mod tests {
         assert!(RULES.contains("table inet berth"));
         assert!(RULES.contains(r#"iifname "berth0" oifname "berth0" drop"#));
         assert!(RULES.contains("169.254.0.0/16"));
-        // Host ports are per berth, by its address.
+        // Host ports are per berth, by its address, and no berth can borrow
+        // another's address.
         assert!(RULES.contains("ip saddr . tcp dport @host_access accept"));
+        assert!(RULES.contains("iifname . ip saddr != @senders drop"));
+        assert!(RULES.contains("iifname . arp saddr ip != @senders drop"));
     }
 }

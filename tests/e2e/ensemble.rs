@@ -52,6 +52,28 @@ fn a_berth_reaches_only_the_host_ports_it_was_given() {
 
 #[test]
 #[ignore = "needs a running berthd; run with --ignored"]
+fn a_berth_cant_borrow_another_berths_address() {
+    let proxy = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = proxy.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in proxy.incoming().flatten() {
+            let _ = c.write_all(b"secret\n");
+        }
+    });
+    let victim = Berth::new(&["--host-port", &port.to_string()]);
+    let thief = Berth::new(&[]);
+    let victim_ip = victim.info()["ip"].as_str().unwrap().to_string();
+    let probe = format!("timeout 3 bash -c 'exec 3<>/dev/tcp/10.200.0.1/{port}; head -1 <&3'");
+    assert_eq!(victim.sh_ok(&probe), "secret");
+    // The thief takes the victim's address, as its root may, and tries again.
+    thief.root(&format!(
+        "ip addr flush dev eth0 && ip addr add {victim_ip}/16 dev eth0 && ip route add default via 10.200.0.1"
+    ));
+    assert!(!thief.sh(&probe).status.success(), "a berth reached another's host port with its address");
+}
+
+#[test]
+#[ignore = "needs a running berthd; run with --ignored"]
 fn socks_serves_on_a_tcp_port_for_ensembles_previews() {
     let b = Berth::new(&[]);
     b.serve("127.0.0.1", 3000, "preview");

@@ -26,3 +26,18 @@ table inet berth {
     ip saddr 10.200.0.0/16 oifname != "berth0" masquerade
   }
 }
+
+# A berth's root owns its network namespace and could take another berth's
+# address. On the bridge, before anything is routed, a berth's port only
+# passes what carries its own address: host ports and mirrors are granted by
+# address, so no berth can borrow another's.
+table bridge berth {
+  set senders { type ifname . ipv4_addr; }
+
+  chain prerouting {
+    type filter hook prerouting priority -10; policy accept;
+    iifname "bh*" ether type ip iifname . ip saddr != @senders drop
+    iifname "bh*" ether type arp iifname . arp saddr ip != @senders drop
+    iifname "bh*" ether type ip6 drop
+  }
+}

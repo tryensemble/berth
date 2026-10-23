@@ -54,7 +54,20 @@ fn set_swap(b: &Berth, allowed: bool) {
 pub fn settle(b: &Berth, pid: i32) -> anyhow::Result<()> {
     let cg = b.cgroup();
     fs::write(cg.join("init/cgroup.procs"), pid.to_string()).context("moving init into its cgroup")?;
-    fs::write(cg.join("cgroup.subtree_control"), CONTROLLERS).context("enabling the berth's controllers")?;
+    // The outer init process has exited and been reaped, but the kernel lets
+    // go of an exited task's cgroup a moment later; until then the berth's
+    // cgroup still counts it and refuses controllers with EBUSY.
+    let mut tries = 0;
+    loop {
+        match fs::write(cg.join("cgroup.subtree_control"), CONTROLLERS) {
+            Ok(()) => break,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("enabling the berth's controllers"),
+        }
+    }
     let owner = Some(b.uid_base);
     for dir in [cg.clone(), cg.join("init")] {
         chown(&dir, owner, owner)?;
