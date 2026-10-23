@@ -23,6 +23,8 @@ pub enum Route<'a> {
     Idle(&'a str),
     /// `POST /v1/berths/{id}/stop`
     Stop(&'a str),
+    /// `POST /v1/berths/{id}/trim`
+    Trim(&'a str),
     /// `GET /v1/berths/{id}/services`
     Services(&'a str),
     /// `DELETE /v1/berths/{id}/services/{name}`
@@ -74,6 +76,7 @@ impl<'a> Route<'a> {
             ("POST", ["v1", "berths", id, "start"]) => Route::Start(id),
             ("POST", ["v1", "berths", id, "idle"]) => Route::Idle(id),
             ("POST", ["v1", "berths", id, "stop"]) => Route::Stop(id),
+            ("POST", ["v1", "berths", id, "trim"]) => Route::Trim(id),
             ("GET", ["v1", "berths", id, "services"]) => Route::Services(id),
             ("DELETE", ["v1", "berths", id, "services", name]) => Route::RemoveService(id, name),
             ("POST", ["v1", "berths", id, "snapshots"]) => Route::Snapshot(id),
@@ -115,6 +118,7 @@ mod tests {
         assert_eq!(Route::parse("POST", "/v1/berths/ab/start", false), Some(Route::Start("ab")));
         assert_eq!(Route::parse("POST", "/v1/berths/ab/idle", false), Some(Route::Idle("ab")));
         assert_eq!(Route::parse("POST", "/v1/berths/ab/stop", false), Some(Route::Stop("ab")));
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/trim", false), Some(Route::Trim("ab")));
         assert_eq!(Route::parse("GET", "/v1/berths/ab/services", false), Some(Route::Services("ab")));
         assert_eq!(
             Route::parse("DELETE", "/v1/berths/ab/services/web", false),

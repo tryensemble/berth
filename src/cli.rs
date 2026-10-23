@@ -61,6 +61,12 @@ pub enum Cmd {
         /// Whose berth it is: one tenant's berths share caches, never more
         #[arg(long)]
         tenant: Option<String>,
+        /// A unique name to use instead of its id (a thread's id, say)
+        #[arg(long)]
+        name: Option<String>,
+        /// A host port the berth may reach on its gateway, 10.200.0.1 (repeatable)
+        #[arg(long = "host-port")]
+        host_ports: Vec<u16>,
     },
     /// Run a command in a berth, starting the berth if it's idle or stopped
     Exec {
@@ -105,6 +111,8 @@ pub enum Cmd {
     Idle { ids: Vec<String> },
     /// Stop berths: nothing runs, their files and services stay
     Stop { ids: Vec<String> },
+    /// Hand back what a running berth's memory holds that can be dropped
+    Trim { ids: Vec<String> },
     /// A berth's services
     #[command(subcommand)]
     Service(ServiceCmd),
@@ -122,6 +130,9 @@ pub enum Cmd {
         /// Move the fork's workspace to this branch
         #[arg(long)]
         branch: Option<String>,
+        /// A unique name for the fork
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List the TCP ports something listens on in a berth
@@ -140,8 +151,14 @@ pub enum Cmd {
         #[arg(long)]
         local: Option<u16>,
     },
-    /// Print the path of a berth's SOCKS5 socket, where localhost is the berth
-    Socks { id: String },
+    /// Print the path of a berth's SOCKS5 socket, where localhost is the berth,
+    /// or serve it on a TCP address
+    Socks {
+        id: String,
+        /// Serve the socket on this address, like 127.0.0.1:1080, until stopped
+        #[arg(long)]
+        listen: Option<String>,
+    },
     /// Serve a berth's port on a host port, now and after restarts
     Publish {
         id: String,
@@ -191,6 +208,8 @@ pub enum LayerCmd {
         #[arg(long = "from")]
         from: Vec<String>,
     },
+    /// Keep what a berth installed as the layer name, and remove the berth
+    Commit { id: String, name: String },
     /// List layers
     Ls,
     /// Remove a layer no berth uses
@@ -253,6 +272,10 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Cmd::Layer(LayerCmd::Ls) => print_names(&api.json("GET", "/v1/layers", None)?),
+        Cmd::Layer(LayerCmd::Commit { id, name }) => {
+            api.json("POST", "/v1/layers", Some(&json!({ "berth": id, "name": name })))?;
+            Ok(0)
+        }
         Cmd::Layer(LayerCmd::Rm { name }) => {
             api.json("DELETE", &format!("/v1/layers/{name}"), None)?;
             Ok(0)
@@ -296,7 +319,21 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             eprintln!("berth: layer {name} is ready");
             Ok(0)
         }
-        Cmd::Create { project, branch, image, layers, cpus, memory, pids, tmp, idle_after, stop_after, tenant } => {
+        Cmd::Create {
+            project,
+            branch,
+            image,
+            layers,
+            cpus,
+            memory,
+            pids,
+            tmp,
+            idle_after,
+            stop_after,
+            tenant,
+            name,
+            host_ports,
+        } => {
             let v = api.json(
                 "POST",
                 "/v1/berths",
@@ -304,6 +341,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                     "project": project, "branch": branch, "image": image, "layers": layers,
                     "cpus": cpus, "memory": memory, "pids": pids, "tmp": tmp,
                     "idle_after": idle_after, "stop_after": stop_after, "tenant": tenant,
+                    "name": name, "host_ports": host_ports,
                 })),
             )?;
             println!("{}", v["id"].as_str().unwrap_or(""));
@@ -329,6 +367,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
         Cmd::Start { ids } => each(&api, &ids, "start"),
         Cmd::Idle { ids } => each(&api, &ids, "idle"),
         Cmd::Stop { ids } => each(&api, &ids, "stop"),
+        Cmd::Trim { ids } => each(&api, &ids, "trim"),
         Cmd::Service(ServiceCmd::Ls { id, json }) => {
             let v = api.json("GET", &format!("/v1/berths/{id}/services"), None)?;
             if json {
@@ -367,11 +406,11 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             api.json("POST", &format!("/v1/berths/{id}/restore"), Some(&json!({ "name": name })))?;
             Ok(0)
         }
-        Cmd::Fork { id, snapshot, branch } => {
+        Cmd::Fork { id, snapshot, branch, name } => {
             let v = api.json(
                 "POST",
                 &format!("/v1/berths/{id}/fork"),
-                Some(&json!({ "snapshot": snapshot, "branch": branch })),
+                Some(&json!({ "snapshot": snapshot, "branch": branch, "name": name })),
             )?;
             println!("{}", v["id"].as_str().unwrap_or(""));
             Ok(0)
@@ -419,9 +458,24 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Socks { id } => {
+        Cmd::Socks { id, listen } => {
             let v = api.json("GET", &format!("/v1/berths/{id}"), None)?;
-            println!("{}", v["socks"].as_str().unwrap_or(""));
+            let socket = PathBuf::from(v["socks"].as_str().context("no SOCKS socket")?);
+            let Some(listen) = listen else {
+                println!("{}", socket.display());
+                return Ok(0);
+            };
+            let listener = TcpListener::bind(&listen).with_context(|| format!("listening on {listen}"))?;
+            eprintln!("berth: SOCKS5 for berth {id} on {listen}");
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                match UnixStream::connect(&socket) {
+                    Ok(conn) => {
+                        std::thread::spawn(move || pipe::splice(client, conn));
+                    }
+                    Err(e) => eprintln!("berth: {}: {e}", socket.display()),
+                }
+            }
             Ok(0)
         }
         Cmd::Publish { id, port, host_port, address } => {
@@ -450,8 +504,8 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                 return Ok(0);
             }
             println!(
-                "{:<10} {:<8} {:>8}  {:<14} {:<12} {:<16} LAYERS",
-                "ID", "STATUS", "MEMORY", "ADDRESS", "PROJECT", "BRANCH"
+                "{:<10} {:<20} {:<8} {:>8}  {:<14} {:<12} {:<16} LAYERS",
+                "ID", "NAME", "STATUS", "MEMORY", "ADDRESS", "PROJECT", "BRANCH"
             );
             for b in v.as_array().into_iter().flatten() {
                 let s = |k: &str| b[k].as_str().unwrap_or("-").to_string();
@@ -459,8 +513,9 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                     b["layers"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
                 let memory = b["memory"].as_u64().map_or("-".into(), human_size);
                 println!(
-                    "{:<10} {:<8} {:>8}  {:<14} {:<12} {:<16} {}",
+                    "{:<10} {:<20} {:<8} {:>8}  {:<14} {:<12} {:<16} {}",
                     s("id"),
+                    s("name"),
                     s("status"),
                     memory,
                     s("ip"),

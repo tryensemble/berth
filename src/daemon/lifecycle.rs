@@ -20,7 +20,9 @@ use crate::init::{Bind, InitConfig};
 use crate::{image, net, sys};
 
 impl Daemon {
-    pub fn create(&self, spec: CreateSpec) -> anyhow::Result<Berth> {
+    /// Makes a berth. registry is the gateway port of its tenant's registry
+    /// mirror, for berths with Docker.
+    pub fn create(&self, spec: CreateSpec, registry: Option<u16>) -> anyhow::Result<Berth> {
         let image_root = image::rootfs(&paths::state("images"), &spec.image);
         if !image_root.exists() {
             image::pull(&paths::state("images"), &spec.image)?;
@@ -39,6 +41,9 @@ impl Daemon {
             && !valid_name(t)
         {
             bail!("bad tenant name {t}");
+        }
+        if spec.host_ports.contains(&0) {
+            bail!("bad host port 0");
         }
         let idle_after = spec.idle_after.as_deref().map(parse_duration).transpose()?;
         let stop_after = spec.stop_after.as_deref().map(parse_duration).transpose()?;
@@ -61,6 +66,9 @@ impl Daemon {
             services: Vec::new(),
             tenant: spec.tenant.clone(),
             published: Vec::new(),
+            name: spec.name.clone(),
+            host_ports: spec.host_ports.iter().copied().chain(registry).collect(),
+            registry,
         })?;
         let lock = self.lock_of(&b.id);
         let _held = lock.lock().unwrap();
@@ -89,6 +97,14 @@ impl Daemon {
     /// under the table's lock so two berths never share them.
     pub(super) fn reserve(&self, mut b: Berth) -> anyhow::Result<Berth> {
         let mut berths = self.berths.lock().unwrap();
+        if let Some(name) = &b.name {
+            if !valid_name(name) {
+                bail!("bad berth name {name}");
+            }
+            if berths.contains_key(name) || berths.values().any(|o| o.name.as_ref() == Some(name)) {
+                bail!("there's already a berth called {name}");
+            }
+        }
         let used: Vec<u32> = berths.values().map(|b| b.n).collect();
         let n = (2..net::MAX_BERTHS).find(|n| !used.contains(n)).context("this machine is full of berths")?;
         b.id = loop {
@@ -172,7 +188,7 @@ impl Daemon {
             dns: net::resolvers(),
             tmp_size: b.limits.tmp.clone(),
             binds: self.binds(b),
-            docker: Default::default(),
+            docker: crate::init::docker::DockerConfig { registry_mirror: b.registry.map(super::registry::url) },
         };
         let userns = new_userns(b.uid_base)?;
         let (pid, mut go, mut out) = spawn_init(b, &cfg, &userns, &listener)?;

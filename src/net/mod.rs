@@ -31,28 +31,44 @@ pub fn setup_host() -> anyhow::Result<()> {
         anyhow::bail!("loading the nftables rules failed");
     }
 
-    // Docker (and ufw) drop forwarded traffic by default; a drop anywhere wins,
-    // so berths' traffic is accepted there explicitly. Our own drops above
-    // still apply.
-    let chain = if run("iptables", &["-L", "DOCKER-USER", "-n"]).is_ok() {
+    // Docker and ufw drop forwarded and incoming traffic by default, and in
+    // nftables a drop in any table wins, so berths' traffic is accepted in
+    // theirs explicitly. Ours runs first and has already dropped what a berth
+    // may not send: only the rest reaches these.
+    let iptables_policy_drops =
+        |chain: &str| run("iptables", &["-S", chain]).map(|s| s.contains(&format!("-P {chain} DROP"))).unwrap_or(false);
+    let forward = if run("iptables", &["-L", "DOCKER-USER", "-n"]).is_ok() {
         Some("DOCKER-USER")
-    } else if run("iptables", &["-S", "FORWARD"]).map(|s| s.contains("-P FORWARD DROP")).unwrap_or(false) {
+    } else if iptables_policy_drops("FORWARD") {
         Some("FORWARD")
     } else {
         None
     };
-    if let Some(chain) = chain {
-        for rule in [
-            vec!["-i", BRIDGE, "-j", "ACCEPT"],
-            vec!["-o", BRIDGE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-        ] {
-            let mut check = vec!["-C", chain];
-            check.extend(&rule);
-            if run("iptables", &check).is_err() {
-                let mut insert = vec!["-I", chain];
-                insert.extend(&rule);
-                run("iptables", &insert)?;
-            }
+    if let Some(chain) = forward {
+        accept_in(
+            chain,
+            &[
+                &["-i", BRIDGE, "-j", "ACCEPT"],
+                &["-o", BRIDGE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            ],
+        )?;
+    }
+    // A berth's host ports (a secrets proxy) arrive on INPUT.
+    if iptables_policy_drops("INPUT") {
+        accept_in("INPUT", &[&["-i", BRIDGE, "-j", "ACCEPT"]])?;
+    }
+    Ok(())
+}
+
+/// Puts rules at the top of an iptables chain unless they're there.
+fn accept_in(chain: &str, rules: &[&[&str]]) -> anyhow::Result<()> {
+    for rule in rules {
+        let mut check = vec!["-C", chain];
+        check.extend(rule.iter());
+        if run("iptables", &check).is_err() {
+            let mut insert = vec!["-I", chain];
+            insert.extend(rule.iter());
+            run("iptables", &insert)?;
         }
     }
     Ok(())
@@ -93,6 +109,15 @@ pub fn attach(n: u32, pid: i32) -> anyhow::Result<()> {
     inside(&["link", "set", "lo", "up"])?;
     inside(&["route", "add", "default", "via", &GATEWAY.to_string()])?;
     Ok(())
+}
+
+/// Lets the berth at address reach the host's port, or stops it.
+pub fn host_access(address: Ipv4Addr, port: u16, allowed: bool) -> anyhow::Result<()> {
+    let element = format!("{{ {address} . {port} }}");
+    let verb = if allowed { "add" } else { "delete" };
+    let r = run("nft", &[verb, "element", "inet", "berth", "host_access", &element]);
+    // Deleting what isn't there is fine.
+    if allowed { r.map(drop) } else { Ok(()) }
 }
 
 pub fn detach(n: u32) {
@@ -202,5 +227,7 @@ mod tests {
         assert!(RULES.contains("table inet berth"));
         assert!(RULES.contains(r#"iifname "berth0" oifname "berth0" drop"#));
         assert!(RULES.contains("169.254.0.0/16"));
+        // Host ports are per berth, by its address.
+        assert!(RULES.contains("ip saddr . tcp dport @host_access accept"));
     }
 }

@@ -95,22 +95,33 @@ pub fn socks_path(id: &str) -> std::path::PathBuf {
 }
 
 impl Daemon {
-    /// Serves the berth's SOCKS5 socket and its published ports. Called when
-    /// a berth is made and for every berth when the daemon starts.
+    /// Serves the berth's SOCKS5 socket and its published ports, and opens the
+    /// host ports it may reach. Called when a berth is made and for every
+    /// berth when the daemon starts.
     pub fn expose(self: &Arc<Self>, id: &str) {
         if let Err(e) = self.serve_socks(id) {
             eprintln!("berthd: berth {id}: SOCKS socket: {e:#}");
         }
-        let published = self.get(id).map(|b| b.published).unwrap_or_default();
-        for p in published {
+        let Ok(b) = self.get(id) else { return };
+        for port in &b.host_ports {
+            if let Err(e) = crate::net::host_access(crate::net::address(b.n), *port, true) {
+                eprintln!("berthd: berth {id}: host port {port}: {e:#}");
+            }
+        }
+        for p in b.published {
             if let Err(e) = self.listen_published(id, &p) {
                 eprintln!("berthd: berth {id}: publishing port {}: {e:#}", p.port);
             }
         }
     }
 
-    /// Stops serving the berth's ports.
+    /// Stops serving the berth's ports, and its access to the host's.
     pub fn unexpose(&self, id: &str) {
+        if let Ok(b) = self.get(id) {
+            for port in &b.host_ports {
+                let _ = crate::net::host_access(crate::net::address(b.n), *port, false);
+            }
+        }
         self.listeners.remove(&format!("socks:{id}"));
         self.listeners.remove_all(&format!("publish:{id}:"));
         let _ = std::fs::remove_file(socks_path(id));

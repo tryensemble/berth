@@ -7,6 +7,7 @@ mod layer;
 mod lifecycle;
 mod paths;
 mod proxy;
+mod registry;
 mod repo;
 mod routes;
 mod snapshot;
@@ -46,6 +47,8 @@ pub struct Daemon {
     activity: activity::Table,
     /// The SOCKS sockets and published ports served for berths.
     listeners: proxy::Listeners,
+    /// Held while a tenant's registry mirror is found or made.
+    registry_lock: Mutex<()>,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -91,6 +94,7 @@ pub fn main() -> anyhow::Result<()> {
         locks: Mutex::default(),
         activity: Mutex::default(),
         listeners: proxy::Listeners::default(),
+        registry_lock: Mutex::default(),
     });
     d.reconcile();
     let ids: Vec<String> = d.berths.lock().unwrap().keys().cloned().collect();
@@ -199,7 +203,10 @@ impl Daemon {
     fn serve(self: Arc<Self>, mut conn: UnixStream) {
         let Ok(req) = http::read_request(&mut conn) else { return };
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let result = match Route::parse(&req.method, &req.path, req.upgrade) {
+        // A berth may be named by its name too; from here on it's its id, so
+        // locks, activity and logs all know it by one key.
+        let path = self.by_id(&req.path);
+        let result = match Route::parse(&req.method, &path, req.upgrade) {
             Some(route) => self.handle(route, body, &mut conn),
             None => Err(anyhow!("no such endpoint: {} {}", req.method, req.path)),
         };
@@ -226,7 +233,13 @@ impl Daemon {
             }
             Route::Create => {
                 let spec: CreateSpec = serde_json::from_value(body)?;
-                let b = self.create(spec)?;
+                // A berth with Docker pulls through its tenant's mirror.
+                let registry = if registry::enabled() && registry::has_docker(&spec.image, &spec.layers) {
+                    Some(self.registry_for(spec.tenant.as_deref())?)
+                } else {
+                    None
+                };
+                let b = self.create(spec, registry)?;
                 self.expose(&b.id);
                 b.view()
             }
@@ -271,6 +284,14 @@ impl Daemon {
             Route::Start(id) => self.wake(id)?.view(),
             Route::Idle(id) => self.idle(id, None)?.view(),
             Route::Stop(id) => self.stop(id, None)?.view(),
+            Route::Trim(id) => {
+                let b = self.get(id)?;
+                let before = cgroup::memory_current(&b);
+                if b.state == State::Running && b.alive() {
+                    cgroup::trim(&b);
+                }
+                json!({ "id": b.id, "before": before, "after": cgroup::memory_current(&b) })
+            }
             Route::Services(id) => json!(self.get(id)?.services),
             Route::Snapshot(id) => {
                 let name = body["name"].as_str().context("name missing")?;
@@ -286,7 +307,7 @@ impl Daemon {
                 self.restore(id, name)?.view()
             }
             Route::Fork(id) => {
-                let b = self.fork(id, body["snapshot"].as_str(), body["branch"].as_str())?;
+                let b = self.fork(id, body["snapshot"].as_str(), body["branch"].as_str(), body["name"].as_str())?;
                 self.expose(&b.id);
                 b.view()
             }
@@ -356,6 +377,24 @@ impl Daemon {
             bail!("{what} {name} is used by berths {}", users.join(", "));
         }
         Ok(())
+    }
+
+    /// path with a berth's name, if it names one, replaced by its id.
+    fn by_id(&self, path: &str) -> String {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        // ["", "v1", "berths", <id or name>, ...]
+        if parts.len() > 3 && parts[1] == "v1" && parts[2] == "berths" {
+            let berths = self.berths.lock().unwrap();
+            if !berths.contains_key(parts[3])
+                && let Some(b) = berths.values().find(|b| b.name.as_deref() == Some(parts[3]))
+            {
+                let id = b.id.clone();
+                drop(berths);
+                parts[3] = &id;
+                return parts.join("/");
+            }
+        }
+        path.to_string()
     }
 
     fn get(&self, id: &str) -> anyhow::Result<Berth> {

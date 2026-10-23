@@ -2,14 +2,15 @@
 # berth0 (10.200.0.0/16): they reach the internet through NAT, and nothing
 # else - not the host, not each other, not private or link-local networks.
 table inet berth {
-  # Host ports berths may reach on their gateway (a secrets proxy, say).
-  set host_ports { type inet_service; }
+  # Host ports a berth may reach on its gateway (a secrets proxy, say), as
+  # (berth address, port): each berth reaches only the ports it was given.
+  set host_access { type ipv4_addr . inet_service; }
 
   chain input {
     type filter hook input priority -10; policy accept;
     iifname "berth0" ct state established,related accept
     iifname "berth0" meta l4proto icmp accept
-    iifname "berth0" tcp dport @host_ports accept
+    iifname "berth0" ip saddr . tcp dport @host_access accept
     iifname "berth0" drop
   }
 

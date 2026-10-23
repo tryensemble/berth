@@ -224,7 +224,13 @@ impl Daemon {
     /// A new berth with the files and services of a berth, or of one of its
     /// snapshots: frozen for a moment while it's copied, if it runs. With
     /// branch, the fork's workspace moves to that branch.
-    pub fn fork(&self, id: &str, snapshot: Option<&str>, branch: Option<&str>) -> anyhow::Result<Berth> {
+    pub fn fork(
+        &self,
+        id: &str,
+        snapshot: Option<&str>,
+        branch: Option<&str>,
+        name: Option<&str>,
+    ) -> anyhow::Result<Berth> {
         if let Some(br) = branch
             && (br.is_empty() || br.starts_with('-') || br.contains(['\0', '\n', ' ']))
         {
@@ -235,7 +241,7 @@ impl Daemon {
             bail!("berth {id} has no project, so its fork has no branch to move to");
         }
         // A fork serves none of its source's host ports: those are taken.
-        let mut fork = self.reserve(Berth { published: Vec::new(), ..source.clone() })?;
+        let mut fork = self.reserve(Berth { published: Vec::new(), name: name.map(String::from), ..source.clone() })?;
         if let Some(br) = branch {
             fork.branch = Some(br.to_string());
         }

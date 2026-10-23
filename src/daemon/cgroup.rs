@@ -95,6 +95,31 @@ pub fn reclaim(b: &Berth) {
     }
 }
 
+/// Hands back what the berth's memory holds that can be dropped (file cache,
+/// mostly) without freezing it or touching its programs' own memory: running
+/// berths have no swap to push that to. Pages still being written need
+/// writing first, so it takes a few passes while memory keeps going down.
+pub fn trim(b: &Berth) {
+    // Dirty pages can't be dropped until they're written, which the kernel
+    // otherwise does within 30 s: write them now. syncfs writes the whole
+    // filesystem the berth's files are on, which is what an explicit trim
+    // can afford.
+    if let Ok(dir) = fs::File::open(b.dir()) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::syncfs(dir.as_raw_fd()) };
+    }
+    let mut last = u64::MAX;
+    for _ in 0..5 {
+        let Some(current) = memory_current(b) else { return };
+        if current >= last || current < 1 << 20 {
+            return;
+        }
+        last = current;
+        let _ = fs::write(b.cgroup().join("memory.reclaim"), current.to_string());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn memory_current(b: &Berth) -> Option<u64> {
     fs::read_to_string(b.cgroup().join("memory.current")).ok()?.trim().parse().ok()
 }

@@ -45,6 +45,11 @@ pub struct CreateSpec {
     /// Whose berth it is: berths of one tenant share caches and a registry
     /// mirror, never anything else.
     pub tenant: Option<String>,
+    /// A name to find it by instead of its id (a thread's id, say); unique.
+    pub name: Option<String>,
+    /// Host ports the berth may reach on its gateway (a secrets proxy, say).
+    #[serde(default)]
+    pub host_ports: Vec<u16>,
 }
 
 /// How long a berth may go unused before it's frozen, and before it's stopped.
@@ -121,6 +126,13 @@ pub struct Berth {
     /// Its ports served on the host.
     #[serde(default)]
     pub published: Vec<super::proxy::Published>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub host_ports: Vec<u16>,
+    /// The gateway port of its tenant's registry mirror, when it has Docker.
+    #[serde(default)]
+    pub registry: Option<u16>,
 }
 
 fn default_idle_after() -> u64 {
@@ -253,6 +265,7 @@ mod tests {
         assert_eq!(spec.image, "ubuntu:24.04");
         assert_eq!((spec.cpus, spec.memory.as_str(), spec.pids, spec.tmp.as_str()), (2.0, "4G", 4096, "1G"));
         assert!(spec.layers.is_empty() && spec.project.is_none());
+        assert!(spec.host_ports.is_empty() && spec.name.is_none());
     }
 
     #[test]
