@@ -27,6 +27,20 @@ pub enum Route<'a> {
     Services(&'a str),
     /// `DELETE /v1/berths/{id}/services/{name}`
     RemoveService(&'a str, &'a str),
+    /// `POST /v1/berths/{id}/snapshots`
+    Snapshot(&'a str),
+    /// `GET /v1/berths/{id}/snapshots`
+    Snapshots(&'a str),
+    /// `DELETE /v1/berths/{id}/snapshots/{name}`
+    RemoveSnapshot(&'a str, &'a str),
+    /// `POST /v1/berths/{id}/restore`
+    Restore(&'a str),
+    /// `POST /v1/berths/{id}/fork`
+    Fork(&'a str),
+    /// `POST /v1/berths/{id}/publish`
+    Publish(&'a str),
+    /// `DELETE /v1/berths/{id}/publish/{port}`
+    Unpublish(&'a str, &'a str),
     /// `POST /v1/images`
     PullImage,
     /// `GET /v1/images`
@@ -62,6 +76,13 @@ impl<'a> Route<'a> {
             ("POST", ["v1", "berths", id, "stop"]) => Route::Stop(id),
             ("GET", ["v1", "berths", id, "services"]) => Route::Services(id),
             ("DELETE", ["v1", "berths", id, "services", name]) => Route::RemoveService(id, name),
+            ("POST", ["v1", "berths", id, "snapshots"]) => Route::Snapshot(id),
+            ("GET", ["v1", "berths", id, "snapshots"]) => Route::Snapshots(id),
+            ("DELETE", ["v1", "berths", id, "snapshots", name]) => Route::RemoveSnapshot(id, name),
+            ("POST", ["v1", "berths", id, "restore"]) => Route::Restore(id),
+            ("POST", ["v1", "berths", id, "fork"]) => Route::Fork(id),
+            ("POST", ["v1", "berths", id, "publish"]) => Route::Publish(id),
+            ("DELETE", ["v1", "berths", id, "publish", port]) => Route::Unpublish(id, port),
             ("POST", ["v1", "images"]) => Route::PullImage,
             ("GET", ["v1", "images"]) => Route::Images,
             ("POST", ["v1", "repos"]) => Route::AddRepo,
@@ -99,6 +120,20 @@ mod tests {
             Route::parse("DELETE", "/v1/berths/ab/services/web", false),
             Some(Route::RemoveService("ab", "web"))
         );
+    }
+
+    #[test]
+    fn snapshot_routes() {
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/snapshots", false), Some(Route::Snapshot("ab")));
+        assert_eq!(Route::parse("GET", "/v1/berths/ab/snapshots", false), Some(Route::Snapshots("ab")));
+        assert_eq!(
+            Route::parse("DELETE", "/v1/berths/ab/snapshots/s1", false),
+            Some(Route::RemoveSnapshot("ab", "s1"))
+        );
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/restore", false), Some(Route::Restore("ab")));
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/fork", false), Some(Route::Fork("ab")));
+        assert_eq!(Route::parse("POST", "/v1/berths/ab/publish", false), Some(Route::Publish("ab")));
+        assert_eq!(Route::parse("DELETE", "/v1/berths/ab/publish/3000", false), Some(Route::Unpublish("ab", "3000")));
     }
 
     #[test]

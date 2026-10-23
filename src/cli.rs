@@ -108,6 +108,21 @@ pub enum Cmd {
     /// A berth's services
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Snapshots: a berth's files and services at a moment, kept to go back to
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+    /// Put a berth back as it was in one of its snapshots
+    Restore { id: String, name: String },
+    /// Make a new berth from a berth, or one of its snapshots; prints its id
+    Fork {
+        id: String,
+        /// Fork from this snapshot instead of the berth as it is now
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Move the fork's workspace to this branch
+        #[arg(long)]
+        branch: Option<String>,
+    },
 
     /// List the TCP ports something listens on in a berth
     Ports {
@@ -125,6 +140,21 @@ pub enum Cmd {
         #[arg(long)]
         local: Option<u16>,
     },
+    /// Print the path of a berth's SOCKS5 socket, where localhost is the berth
+    Socks { id: String },
+    /// Serve a berth's port on a host port, now and after restarts
+    Publish {
+        id: String,
+        port: u16,
+        /// Host port (the same as the berth's by default)
+        #[arg(long)]
+        host_port: Option<u16>,
+        /// Host address to listen on; anyone who can reach it reaches the port
+        #[arg(long, default_value = "127.0.0.1")]
+        address: String,
+    },
+    /// Stop serving a berth's port on the host
+    Unpublish { id: String, port: u16 },
     /// Remove berths and everything in them
     Destroy { ids: Vec<String> },
     /// List berths
@@ -165,6 +195,20 @@ pub enum LayerCmd {
     Ls,
     /// Remove a layer no berth uses
     Rm { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum SnapshotCmd {
+    /// Take a snapshot (the berth is frozen for the moment it takes)
+    Create { id: String, name: String },
+    /// List a berth's snapshots
+    Ls {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a snapshot
+    Rm { id: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -298,6 +342,40 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Snapshot(SnapshotCmd::Create { id, name }) => {
+            api.json("POST", &format!("/v1/berths/{id}/snapshots"), Some(&json!({ "name": name })))?;
+            Ok(0)
+        }
+        Cmd::Snapshot(SnapshotCmd::Ls { id, json }) => {
+            let v = api.json("GET", &format!("/v1/berths/{id}/snapshots"), None)?;
+            if json {
+                println!("{v}");
+                return Ok(0);
+            }
+            println!("{:<20} CREATED", "NAME");
+            for s in v.as_array().into_iter().flatten() {
+                let ago = now_secs().saturating_sub(s["created"].as_u64().unwrap_or(0));
+                println!("{:<20} {} ago", s["name"].as_str().unwrap_or(""), human_duration(ago));
+            }
+            Ok(0)
+        }
+        Cmd::Snapshot(SnapshotCmd::Rm { id, name }) => {
+            api.json("DELETE", &format!("/v1/berths/{id}/snapshots/{name}"), None)?;
+            Ok(0)
+        }
+        Cmd::Restore { id, name } => {
+            api.json("POST", &format!("/v1/berths/{id}/restore"), Some(&json!({ "name": name })))?;
+            Ok(0)
+        }
+        Cmd::Fork { id, snapshot, branch } => {
+            let v = api.json(
+                "POST",
+                &format!("/v1/berths/{id}/fork"),
+                Some(&json!({ "snapshot": snapshot, "branch": branch })),
+            )?;
+            println!("{}", v["id"].as_str().unwrap_or(""));
+            Ok(0)
+        }
         Cmd::Service(ServiceCmd::Rm { id, name }) => {
             api.json("DELETE", &format!("/v1/berths/{id}/services/{name}"), None)?;
             Ok(0)
@@ -339,6 +417,24 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
                     Err(e) => eprintln!("berth: {e:#}"),
                 });
             }
+            Ok(0)
+        }
+        Cmd::Socks { id } => {
+            let v = api.json("GET", &format!("/v1/berths/{id}"), None)?;
+            println!("{}", v["socks"].as_str().unwrap_or(""));
+            Ok(0)
+        }
+        Cmd::Publish { id, port, host_port, address } => {
+            let v = api.json(
+                "POST",
+                &format!("/v1/berths/{id}/publish"),
+                Some(&json!({ "port": port, "host_port": host_port, "address": address })),
+            )?;
+            println!("{}:{}", v["address"].as_str().unwrap_or(""), v["host_port"]);
+            Ok(0)
+        }
+        Cmd::Unpublish { id, port } => {
+            api.json("DELETE", &format!("/v1/berths/{id}/publish/{port}"), None)?;
             Ok(0)
         }
         Cmd::Destroy { ids } => {
@@ -391,6 +487,20 @@ fn each(api: &Client, ids: &[String], action: &str) -> anyhow::Result<i32> {
         api.json("POST", &format!("/v1/berths/{id}/{action}"), None)?;
     }
     Ok(0)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Seconds the way people read them: 40s, 5m, 3h, 2d.
+fn human_duration(s: u64) -> String {
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
 }
 
 /// Bytes the way people read them: 812K, 41M, 3.2G.
@@ -530,6 +640,14 @@ mod tests {
         let lookup = |k: &str| (k == "API_KEY").then(|| "secret=1".to_string());
         let env = resolve_env(vec!["A=1".into(), "API_KEY".into(), "UNSET".into(), "B=".into()], lookup);
         assert_eq!(env, ["A=1", "API_KEY=secret=1", "B="]);
+    }
+
+    #[test]
+    fn durations_read_like_people_write_them() {
+        assert_eq!(human_duration(40), "40s");
+        assert_eq!(human_duration(300), "5m");
+        assert_eq!(human_duration(3 * 3600 + 5), "3h");
+        assert_eq!(human_duration(2 * 86400), "2d");
     }
 
     #[test]

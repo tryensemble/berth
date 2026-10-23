@@ -34,6 +34,15 @@ pub fn shift_owners(p: &Path, base: u32) -> anyhow::Result<()> {
     shift(p, |id| if (base..base + UID_COUNT).contains(&id) { id - base } else { id })
 }
 
+/// Moves files owned by one berth's ids (from..from+65536) to another's, so a
+/// copy of a berth's files belongs to the berth it's copied into.
+pub fn rebase_owners(p: &Path, from: u32, to: u32) -> anyhow::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    shift(p, |id| if (from..from + UID_COUNT).contains(&id) { id - from + to } else { id })
+}
+
 fn shift(p: &Path, f: impl Fn(u32) -> u32 + Copy) -> anyhow::Result<()> {
     let m = fs::symlink_metadata(p)?;
     let (uid, gid) = (f(m.uid()), f(m.gid()));

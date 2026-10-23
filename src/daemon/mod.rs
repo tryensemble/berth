@@ -9,6 +9,7 @@ mod paths;
 mod proxy;
 mod repo;
 mod routes;
+mod snapshot;
 mod spawn;
 mod store;
 
@@ -43,6 +44,8 @@ pub struct Daemon {
     /// One lock per berth, held by anything that changes it.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     activity: activity::Table,
+    /// The SOCKS sockets and published ports served for berths.
+    listeners: proxy::Listeners,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -53,7 +56,7 @@ pub fn main() -> anyhow::Result<()> {
     // repos are only ever read or mounted by the daemon (they hold setuid
     // files and private source): no one else may reach them.
     for (d, mode) in [
-        (PathBuf::from(paths::STATE), 0o711),
+        (paths::state_root().to_path_buf(), 0o711),
         (paths::state("berths"), 0o711),
         (paths::state("images"), 0o700),
         (paths::state("layers"), 0o700),
@@ -73,12 +76,27 @@ pub fn main() -> anyhow::Result<()> {
     fs::write(PathBuf::from(paths::CGROUP).join("cgroup.subtree_control"), "+cpu +memory +pids")
         .context("enabling cgroup controllers for berths")?;
     net::setup_host().context("setting up the berths' network")?;
+    if !snapshot::reflinks_work(&paths::state("berths")) {
+        eprintln!(
+            "berthd: {} can't reflink: snapshots and forks are full copies (XFS or btrfs makes them free)",
+            paths::state_root().display()
+        );
+    }
     if fs::read_to_string("/proc/swaps").map(|s| s.lines().count() <= 1).unwrap_or(true) {
         eprintln!("berthd: this machine has no swap: idle berths stay frozen but keep their memory");
     }
 
-    let d = Arc::new(Daemon { berths: Mutex::new(load_berths()), locks: Mutex::default(), activity: Mutex::default() });
+    let d = Arc::new(Daemon {
+        berths: Mutex::new(load_berths()),
+        locks: Mutex::default(),
+        activity: Mutex::default(),
+        listeners: proxy::Listeners::default(),
+    });
     d.reconcile();
+    let ids: Vec<String> = d.berths.lock().unwrap().keys().cloned().collect();
+    for id in ids {
+        d.expose(&id);
+    }
     {
         let berths = d.berths.lock().unwrap();
         let count = |s| berths.values().filter(|b| b.state == s).count();
@@ -125,10 +143,18 @@ fn load_berths() -> HashMap<String, Berth> {
     berths
 }
 
+/// A host group's id, from /etc/group. Read in Rust rather than with
+/// getgrnam, which keeps its answer in a static buffer and isn't safe from
+/// the daemon's many threads.
 fn group_id(name: &str) -> Option<u32> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let g = unsafe { libc::getgrnam(c.as_ptr()) };
-    (!g.is_null()).then(|| unsafe { (*g).gr_gid })
+    group_id_in(&fs::read_to_string("/etc/group").ok()?, name)
+}
+
+fn group_id_in(group: &str, name: &str) -> Option<u32> {
+    group.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 3 && f[0] == name).then(|| f[2].parse().ok()).flatten()
+    })
 }
 
 /// Whether name is fit for a project or layer: one path component, not hidden.
@@ -200,7 +226,9 @@ impl Daemon {
             }
             Route::Create => {
                 let spec: CreateSpec = serde_json::from_value(body)?;
-                self.create(spec)?.view()
+                let b = self.create(spec)?;
+                self.expose(&b.id);
+                b.view()
             }
             Route::Get(id) => self.get(id)?.view(),
             Route::Destroy(id) => {
@@ -244,6 +272,40 @@ impl Daemon {
             Route::Idle(id) => self.idle(id, None)?.view(),
             Route::Stop(id) => self.stop(id, None)?.view(),
             Route::Services(id) => json!(self.get(id)?.services),
+            Route::Snapshot(id) => {
+                let name = body["name"].as_str().context("name missing")?;
+                json!(self.snapshot(id, name)?)
+            }
+            Route::Snapshots(id) => json!(self.snapshots(id)?),
+            Route::RemoveSnapshot(id, name) => {
+                self.remove_snapshot(id, name)?;
+                json!({ "name": name })
+            }
+            Route::Restore(id) => {
+                let name = body["name"].as_str().context("name missing")?;
+                self.restore(id, name)?.view()
+            }
+            Route::Fork(id) => {
+                let b = self.fork(id, body["snapshot"].as_str(), body["branch"].as_str())?;
+                self.expose(&b.id);
+                b.view()
+            }
+            Route::Publish(id) => {
+                let port = body["port"].as_u64().and_then(|p| u16::try_from(p).ok()).context("port missing")?;
+                let host_port = match body["host_port"].as_u64() {
+                    Some(p) => u16::try_from(p).context("bad host port")?,
+                    None => port,
+                };
+                let address = match body["address"].as_str() {
+                    Some(a) => a.parse().context("bad address")?,
+                    None => std::net::IpAddr::from([127, 0, 0, 1]),
+                };
+                json!(self.publish(id, port, address, host_port)?)
+            }
+            Route::Unpublish(id, port) => {
+                self.unpublish(id, port.parse().context("bad port")?)?;
+                json!({ "port": port })
+            }
             Route::RemoveService(id, name) => {
                 self.remove_service(id, name)?;
                 json!({ "service": name })
@@ -304,6 +366,13 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_are_found_by_name() {
+        let group = "root:x:0:\nberth:x:1001:user\nbad\nberthd:x:7:\n";
+        assert_eq!(group_id_in(group, "berth"), Some(1001));
+        assert_eq!(group_id_in(group, "missing"), None);
+    }
 
     #[test]
     fn names_are_single_visible_components() {

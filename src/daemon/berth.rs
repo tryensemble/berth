@@ -118,6 +118,9 @@ pub struct Berth {
     pub services: Vec<ExecSpec>,
     #[serde(default)]
     pub tenant: Option<String>,
+    /// Its ports served on the host.
+    #[serde(default)]
+    pub published: Vec<super::proxy::Published>,
 }
 
 fn default_idle_after() -> u64 {
@@ -162,6 +165,7 @@ impl Berth {
         };
         v["status"] = json!(state.as_str());
         v["memory"] = json!(super::cgroup::memory_current(self));
+        v["socks"] = json!(super::proxy::socks_path(&self.id));
         v
     }
 }

@@ -43,32 +43,25 @@ impl Daemon {
         let idle_after = spec.idle_after.as_deref().map(parse_duration).transpose()?;
         let stop_after = spec.stop_after.as_deref().map(parse_duration).transpose()?;
 
-        // Reserve a number (hence ids and an address) under the lock.
-        let mut b = {
-            let mut berths = self.berths.lock().unwrap();
-            let used: Vec<u32> = berths.values().map(|b| b.n).collect();
-            let n = (2..net::MAX_BERTHS).find(|n| !used.contains(n)).context("this machine is full of berths")?;
-            let b = Berth {
-                id: random_id(),
-                n,
-                uid_base: UID_START + n * UID_COUNT,
-                ip: net::address(n).to_string(),
-                pid: 0,
-                project: spec.project.clone(),
-                branch: spec.branch.clone(),
-                image: spec.image.clone(),
-                layers: spec.layers.clone(),
-                limits: Limits { cpus: spec.cpus, memory: spec.memory.clone(), pids: spec.pids, tmp: spec.tmp.clone() },
-                created: now(),
-                state: State::Stopped,
-                idle_after: idle_after.unwrap_or(super::berth::DEFAULT_IDLE_AFTER),
-                stop_after: stop_after.unwrap_or(super::berth::DEFAULT_STOP_AFTER),
-                services: Vec::new(),
-                tenant: spec.tenant.clone(),
-            };
-            berths.insert(b.id.clone(), b.clone());
-            b
-        };
+        let mut b = self.reserve(Berth {
+            id: String::new(),
+            n: 0,
+            uid_base: 0,
+            ip: String::new(),
+            pid: 0,
+            project: spec.project.clone(),
+            branch: spec.branch.clone(),
+            image: spec.image.clone(),
+            layers: spec.layers.clone(),
+            limits: Limits { cpus: spec.cpus, memory: spec.memory.clone(), pids: spec.pids, tmp: spec.tmp.clone() },
+            created: now(),
+            state: State::Stopped,
+            idle_after: idle_after.unwrap_or(super::berth::DEFAULT_IDLE_AFTER),
+            stop_after: stop_after.unwrap_or(super::berth::DEFAULT_STOP_AFTER),
+            services: Vec::new(),
+            tenant: spec.tenant.clone(),
+            published: Vec::new(),
+        })?;
         let lock = self.lock_of(&b.id);
         let _held = lock.lock().unwrap();
         let made = (|| -> anyhow::Result<()> {
@@ -92,8 +85,30 @@ impl Daemon {
         }
     }
 
+    /// Gives b a fresh id, number, id range and address, and records it, all
+    /// under the table's lock so two berths never share them.
+    pub(super) fn reserve(&self, mut b: Berth) -> anyhow::Result<Berth> {
+        let mut berths = self.berths.lock().unwrap();
+        let used: Vec<u32> = berths.values().map(|b| b.n).collect();
+        let n = (2..net::MAX_BERTHS).find(|n| !used.contains(n)).context("this machine is full of berths")?;
+        b.id = loop {
+            let id = random_id();
+            if !berths.contains_key(&id) {
+                break id;
+            }
+        };
+        b.n = n;
+        b.uid_base = UID_START + n * UID_COUNT;
+        b.ip = net::address(n).to_string();
+        b.pid = 0;
+        b.state = State::Stopped;
+        b.created = now();
+        berths.insert(b.id.clone(), b.clone());
+        Ok(b)
+    }
+
     /// The berth's directories, made once.
-    fn prepare(&self, b: &Berth) -> anyhow::Result<()> {
+    pub(super) fn prepare(&self, b: &Berth) -> anyhow::Result<()> {
         let d = b.dir();
         for sub in ["upper", "work", "root", "workspace", "docker"] {
             fs::create_dir_all(d.join(sub))?;
@@ -121,7 +136,7 @@ impl Daemon {
 
     /// Starts a berth whose files are ready: its root, cgroup, init, network
     /// and services. Holds the berth's lock.
-    fn boot(&self, b: &mut Berth) -> anyhow::Result<()> {
+    pub(super) fn boot(&self, b: &mut Berth) -> anyhow::Result<()> {
         let d = b.dir();
         // Berths from before Docker came have no directory for it.
         if !d.join("docker").exists() {
@@ -310,7 +325,8 @@ impl Daemon {
     }
 
     /// Takes a berth down and removes its files and record. Holds its lock.
-    fn remove(&self, b: &Berth) {
+    pub(super) fn remove(&self, b: &Berth) {
+        self.unexpose(&b.id);
         if let Err(e) = self.teardown(b) {
             eprintln!("berthd: {e:#}");
             return;
