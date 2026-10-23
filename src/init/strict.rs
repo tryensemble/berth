@@ -157,7 +157,7 @@ fn hostname() -> String {
     fs::read_to_string("/etc/hostname").map(|h| h.trim().to_string()).unwrap_or_else(|_| "berth".into())
 }
 
-/// A small random number/// A small random number, for a unique sandbox id.
+/// A small random number, for a unique sandbox id.
 fn rand() -> u32 {
     let mut b = [0u8; 4];
     use std::io::Read;
