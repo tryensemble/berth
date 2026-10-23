@@ -52,7 +52,7 @@ Node:
 | | |
 |---|---|
 | Create a berth | ~30 ms |
-| Run a command in one | ~4 ms |
+| Run a command in one | ~4 ms (~35 ms under `--strict`, a gVisor sandbox per command) |
 | Wake an idle berth | a few ms |
 | 30 berths, each running a server | ~28 MB total (~0.9 MB each) |
 | 30 berths, idle | ~16 MB total (~0.5 MB each) |
