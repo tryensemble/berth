@@ -25,6 +25,8 @@ pub enum Cmd {
     Daemon,
     /// Pull an OCI image berths can be made from
     Pull { reference: String },
+    /// Remove a pulled image no berth uses, by reference or as `images` lists it
+    Rmi { image: String },
     /// List pulled images
     Images,
     /// Projects' repositories, mirrored for their berths
@@ -274,6 +276,17 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
         Cmd::Images => print_names(&api.json("GET", "/v1/images", None)?),
+        Cmd::Rmi { image } => {
+            // As listed, or a reference to find it by.
+            let listed = api.json("GET", "/v1/images", None)?;
+            let key = if listed.as_array().is_some_and(|l| l.iter().any(|n| n == image.as_str())) {
+                image
+            } else {
+                crate::image::Reference::parse(&image).key()
+            };
+            api.json("DELETE", &format!("/v1/images/{key}"), None)?;
+            Ok(0)
+        }
         Cmd::Repo(RepoCmd::Add { name, url }) => {
             api.json("POST", "/v1/repos", Some(&json!({ "name": name, "url": url })))?;
             Ok(0)

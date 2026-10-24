@@ -47,6 +47,8 @@ pub enum Route<'a> {
     PullImage,
     /// `GET /v1/images`
     Images,
+    /// `DELETE /v1/images/{name}`
+    RemoveImage(&'a str),
     /// `POST /v1/repos`
     AddRepo,
     /// `GET /v1/repos`
@@ -88,6 +90,7 @@ impl<'a> Route<'a> {
             ("DELETE", ["v1", "berths", id, "publish", port]) => Route::Unpublish(id, port),
             ("POST", ["v1", "images"]) => Route::PullImage,
             ("GET", ["v1", "images"]) => Route::Images,
+            ("DELETE", ["v1", "images", name]) => Route::RemoveImage(name),
             ("POST", ["v1", "repos"]) => Route::AddRepo,
             ("GET", ["v1", "repos"]) => Route::Repos,
             ("DELETE", ["v1", "repos", name]) => Route::RemoveRepo(name),
@@ -143,6 +146,10 @@ mod tests {
     #[test]
     fn store_routes() {
         assert_eq!(Route::parse("GET", "/v1/images", false), Some(Route::Images));
+        assert_eq!(
+            Route::parse("DELETE", "/v1/images/docker.io_library_alpine_3.20", false),
+            Some(Route::RemoveImage("docker.io_library_alpine_3.20"))
+        );
         assert_eq!(Route::parse("GET", "/v1/layers", false), Some(Route::Layers));
         assert_eq!(Route::parse("DELETE", "/v1/layers/tools", false), Some(Route::RemoveLayer("tools")));
         assert_eq!(Route::parse("GET", "/v1/repos", false), Some(Route::Repos));

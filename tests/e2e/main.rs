@@ -14,6 +14,7 @@ mod basics;
 mod docker;
 mod ensemble;
 mod hardening;
+mod images;
 mod lifecycle;
 mod ports;
 mod snapshots;

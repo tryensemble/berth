@@ -423,7 +423,7 @@ berth idle | stop | start | trim  ID
 berth snapshot create|ls|rm ID [NAME]  berth restore ID NAME  berth fork ID [--snapshot S] [--branch B]
 berth destroy  ID
 berth ls       [--json]
-berth repo add|ls|rm           berth layer build|commit|ls|rm      berth pull REF
+berth repo add|ls|rm           berth layer build|commit|ls|rm      berth pull|rmi REF
 ```
 
 Wherever an ID goes, a berth's name goes too.

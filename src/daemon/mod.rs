@@ -352,6 +352,11 @@ impl Daemon {
                 json!({ "reference": reference, "rootfs": root })
             }
             Route::Images => json!(store::list(&paths::state("images"), |p| p.join("rootfs").is_dir())),
+            Route::RemoveImage(name) => {
+                self.unused("image", name, |b| image::Reference::parse(&b.image).key() == name)?;
+                image::remove(&paths::state("images"), name)?;
+                json!({ "name": name })
+            }
             Route::Repos => json!(
                 store::list(&paths::state("repos"), |_| true)
                     .into_iter()
