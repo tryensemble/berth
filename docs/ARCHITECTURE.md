@@ -190,9 +190,11 @@ from youki's crates and Codex's Linux sandbox:
   account is named `berth`, which could map the reservation. Ids handed out
   outside those files can't be checked: directory-service accounts (LDAP,
   SSSD), and the ranges systemd-nspawn picks for itself or Incus and LXD take
-  when root has no subordinate ids. Keep those out of the range. The range
-  is large (868928 up, for 65000 berths), which leaves `useradd` room for
-  about a dozen users' subordinate ids in its default span.
+  when root has no subordinate ids. Keep those out of the range. Its size
+  follows how many berths the machine may hold, `BERTH_MAX_BERTHS` (4096 by
+  default, up to 65000): ids 868928 to about 269 million by default, which
+  leaves `useradd` most of its own span (to 600100000). The daemon won't
+  start with a limit lower than a berth it already has.
 - **The daemon never runs strangers' code or parsers as host root**: git
   fetches run as an id of their own that owns only the mirrors, and only over
   git's ordinary transports.

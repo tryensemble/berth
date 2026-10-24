@@ -64,6 +64,13 @@ pub fn main() -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("berthd runs as root");
     }
+    let berths = load_berths();
+    // A berth past the limit has ids outside the reservation.
+    if let Some(b) = berths.values().find(|b| b.n >= ids::max_berths()) {
+        bail!("berth {} is number {}, past BERTH_MAX_BERTHS={}; raise it", b.id, b.n, ids::max_berths());
+    }
+    // Only now, so a limit too low for the berths there doesn't shrink the
+    // reservation from under them.
     ids::check_and_reserve()?;
     // Berths' inits enter berths/<id> as their own root. Images, layers and
     // repos are only ever read or mounted by the daemon (they hold setuid
@@ -100,7 +107,7 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     let d = Arc::new(Daemon {
-        berths: Mutex::new(load_berths()),
+        berths: Mutex::new(berths),
         locks: Mutex::default(),
         activity: Mutex::default(),
         listeners: proxy::Listeners::default(),

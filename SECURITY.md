@@ -34,10 +34,10 @@ Known limits, which aren't bugs to report:
   see past them, but the kernel's own checks still keep it from anything
   that matters (see [the architecture](docs/ARCHITECTURE.md#isolation-of-a-berth)).
 - The daemon checks `/etc/passwd`, `/etc/group`, `/etc/subuid` and
-  `/etc/subgid` against berth's ids (868928 up), but can't see ids handed out
-  elsewhere: directory-service accounts (LDAP, SSSD), or ranges
-  systemd-nspawn, Incus or LXD pick for themselves. Keep those out of the
-  range.
+  `/etc/subgid` against berth's ids (868928 up, as many as `BERTH_MAX_BERTHS`
+  needs), but can't see ids handed out elsewhere: directory-service accounts
+  (LDAP, SSSD), or ranges systemd-nspawn, Incus or LXD pick for themselves.
+  Keep those out of the range.
 - Members of the `berth` group control every berth on the machine, and can
   reach any berth's ports through its SOCKS socket; the group is for
   operators, not for the agents.

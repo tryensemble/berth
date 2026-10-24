@@ -107,7 +107,9 @@ impl Daemon {
             }
         }
         let used: Vec<u32> = berths.values().map(|b| b.n).collect();
-        let n = (2..net::MAX_BERTHS).find(|n| !used.contains(n)).context("this machine is full of berths")?;
+        let n = (2..super::ids::max_berths())
+            .find(|n| !used.contains(n))
+            .context("this machine is full of berths (BERTH_MAX_BERTHS)")?;
         b.id = loop {
             let id = random_id();
             if !berths.contains_key(&id) {
