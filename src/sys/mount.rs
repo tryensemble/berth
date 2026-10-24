@@ -46,14 +46,36 @@ struct MountAttr {
 
 const OPEN_TREE_CLONE: libc::c_uint = 1;
 const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const MOUNT_ATTR_NOSUID: u64 = 0x2;
+const MOUNT_ATTR_NODEV: u64 = 0x4;
+const MOUNT_ATTR_NOEXEC: u64 = 0x8;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 
 /// Bind-mounts src at target, read-only, with its owners shifted by the user
 /// namespace userns: what host uid 0 owns appears owned by the namespace's root.
 pub fn idmapped_bind(src: &Path, target: &Path, userns: RawFd) -> io::Result<()> {
-    let s = cstr(src);
+    let tree = idmapped_tree(src, userns, true)?;
     let t = cstr(target);
+    let empty = CString::new("").unwrap();
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            tree.as_raw_fd(),
+            empty.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// A mount of src that's in no namespace's tree, reached only through the fd,
+/// with its owners shifted by userns. Writable unless read_only; never
+/// honouring devices, setuid bits or exec.
+pub fn idmapped_tree(src: &Path, userns: RawFd, read_only: bool) -> io::Result<OwnedFd> {
+    let s = cstr(src);
     let empty = CString::new("").unwrap();
     unsafe {
         let fd = libc::syscall(
@@ -66,12 +88,13 @@ pub fn idmapped_bind(src: &Path, target: &Path, userns: RawFd) -> io::Result<()>
             return Err(io::Error::last_os_error());
         }
         let tree = OwnedFd::from_raw_fd(fd as RawFd);
-        let attr = MountAttr {
-            attr_set: MOUNT_ATTR_IDMAP | MOUNT_ATTR_RDONLY,
-            attr_clr: 0,
-            propagation: 0,
-            userns_fd: userns as u64,
-        };
+        let mut set = MOUNT_ATTR_IDMAP;
+        if read_only {
+            set |= MOUNT_ATTR_RDONLY;
+        } else {
+            set |= MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC;
+        }
+        let attr = MountAttr { attr_set: set, attr_clr: 0, propagation: 0, userns_fd: userns as u64 };
         let r = libc::syscall(
             libc::SYS_mount_setattr,
             tree.as_raw_fd(),
@@ -83,17 +106,6 @@ pub fn idmapped_bind(src: &Path, target: &Path, userns: RawFd) -> io::Result<()>
         if r < 0 {
             return Err(io::Error::last_os_error());
         }
-        let r = libc::syscall(
-            libc::SYS_move_mount,
-            tree.as_raw_fd(),
-            empty.as_ptr(),
-            libc::AT_FDCWD,
-            t.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH,
-        );
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        Ok(tree)
     }
-    Ok(())
 }

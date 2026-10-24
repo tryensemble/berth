@@ -186,6 +186,14 @@ pub enum Cmd {
     Init,
     #[command(name = "__hold", hide = true)]
     Hold,
+    /// Unpacks one image layer from stdin into the tree at fd, confined.
+    #[command(name = "__unpack", hide = true)]
+    Unpack {
+        #[arg(long)]
+        tree_fd: i32,
+        #[arg(long)]
+        gzip: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,6 +263,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Daemon => crate::daemon::main().map(|_| 0),
         Cmd::Init => crate::init::main().map(|_| 0),
+        Cmd::Unpack { tree_fd, gzip } => crate::image::unpack_child(tree_fd, gzip).map(|_| 0),
         Cmd::Hold => {
             crate::daemon::hold();
             Ok(0)
