@@ -14,26 +14,56 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
 
 use super::{UID_COUNT, UID_START, UNPACK_UID};
 use crate::net::MAX_BERTHS;
 
+/// Berths a machine holds unless BERTH_MAX_BERTHS says otherwise: plenty for
+/// one machine, and small enough (ids up to about 269 million) to leave
+/// useradd most of its own span for subordinate ids.
+const DEFAULT_MAX_BERTHS: u32 = 4096;
+
 /// The name berth's range is reserved under. The daemon won't start while an
 /// account has it, so no one can map the range through newuidmap.
 const OWNER: &str = "berth";
 
+/// How many berths this machine may hold, which decides how many ids berth
+/// takes: BERTH_MAX_BERTHS, or 4096. Read once; [`check_and_reserve`] has
+/// refused a bad value by the time anything else asks.
+pub fn max_berths() -> u32 {
+    static MAX: OnceLock<u32> = OnceLock::new();
+    *MAX.get_or_init(|| parse_max(std::env::var("BERTH_MAX_BERTHS").ok().as_deref()).unwrap_or(DEFAULT_MAX_BERTHS))
+}
+
+/// A BERTH_MAX_BERTHS value. Berth numbers start at 2 (the gateway has 1),
+/// and the network has addresses for MAX_BERTHS.
+fn parse_max(v: Option<&str>) -> anyhow::Result<u32> {
+    let Some(v) = v else { return Ok(DEFAULT_MAX_BERTHS) };
+    let n: u32 = v.trim().parse().with_context(|| format!("BERTH_MAX_BERTHS={v} isn't a number"))?;
+    if !(3..=MAX_BERTHS).contains(&n) {
+        bail!("BERTH_MAX_BERTHS={v} must be between 3 and {MAX_BERTHS}");
+    }
+    Ok(n)
+}
+
 /// Every host id berth uses: the unpack ids, the fetch id and every berth's
 /// block.
 pub fn range() -> Range<u64> {
-    UNPACK_UID as u64..UID_START as u64 + MAX_BERTHS as u64 * UID_COUNT as u64
+    range_for(max_berths())
+}
+
+fn range_for(max_berths: u32) -> Range<u64> {
+    UNPACK_UID as u64..UID_START as u64 + max_berths as u64 * UID_COUNT as u64
 }
 
 /// Refuses to go on while a host account or subordinate range overlaps
 /// berth's ids, or an account could claim the reservation, then makes sure
 /// the range is reserved.
 pub fn check_and_reserve() -> anyhow::Result<()> {
+    parse_max(std::env::var("BERTH_MAX_BERTHS").ok().as_deref())?;
     let r = range();
     let mut clashes = Vec::new();
     let passwd = read(Path::new("/etc/passwd"))?;
@@ -202,10 +232,24 @@ mod tests {
 
     #[test]
     fn the_range_covers_unpacking_fetching_and_every_berth() {
-        let r = range();
+        let r = range_for(DEFAULT_MAX_BERTHS);
         assert!(r.contains(&(UNPACK_UID as u64)) && r.contains(&(super::super::repo::FETCH_UID as u64)));
-        assert_eq!(r.end, 1_000_000 + 65_000 * 65_536);
-        assert!(r.end <= u32::MAX as u64, "every id fits in a uid_t");
+        // The last berth's last id.
+        assert!(r.contains(&(UID_START as u64 + (DEFAULT_MAX_BERTHS as u64 - 1) * 65_536 + 65_535)));
+        assert_eq!(r.end, 1_000_000 + 4096 * 65_536);
+        // Well inside useradd's default span (to 600100000), leaving it room.
+        assert!(r.end < 300_000_000);
+        assert!(range_for(MAX_BERTHS).end <= u32::MAX as u64, "every id fits in a uid_t");
+    }
+
+    #[test]
+    fn the_berth_count_is_a_setting_within_bounds() {
+        assert_eq!(parse_max(None).unwrap(), DEFAULT_MAX_BERTHS);
+        assert_eq!(parse_max(Some("64")).unwrap(), 64);
+        for bad in ["0", "2", "65001", "many", "-5"] {
+            assert!(parse_max(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(range_for(64).end, 1_000_000 + 64 * 65_536);
     }
 
     #[test]

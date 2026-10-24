@@ -15,7 +15,7 @@ fn help_lists_every_command() {
     let out = berth(&["--help"]);
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["pull", "repo", "layer", "create", "exec", "ports", "proxy", "forward", "destroy", "ls"] {
+    for cmd in ["pull", "rmi", "repo", "layer", "create", "exec", "ports", "proxy", "forward", "destroy", "ls"] {
         assert!(help.contains(cmd), "--help doesn't mention {cmd}:\n{help}");
     }
     assert!(!help.contains("__init"), "internal commands are hidden");

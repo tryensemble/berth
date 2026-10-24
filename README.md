@@ -177,7 +177,7 @@ echo 1 | sudo tee /sys/module/zswap/parameters/enabled
 | `berth fork ID` | A new berth from a berth or one of its snapshots (`--snapshot`, `--branch`, `--name`) |
 | `berth ls` | List berths with their state and memory (`--json` for scripts) |
 | `berth destroy ID...` | Remove berths and everything in them |
-| `berth pull REF` / `berth images` | Pull an OCI image, such as `ubuntu:24.04`, to make berths from |
+| `berth pull REF` / `berth images` / `berth rmi REF` | Pull an OCI image, such as `ubuntu:24.04`, to make berths from; list them; remove one no berth uses |
 | `berth layer build\|commit\|ls\|rm` | Keep what a script (or you, by hand) installed in a berth as a shared, read-only layer |
 | `berth repo add\|ls\|rm` | Mirror a project's repository, or fetch it again |
 
@@ -231,6 +231,7 @@ the connection to a stream with `Upgrade`, as Docker's API does.
 | `GET` | `/v1/berths/{id}/services` | Its services |
 | `DELETE` | `/v1/berths/{id}/services/{name}` | Stop and forget a service |
 | `GET`, `POST` | `/v1/images` | List, or pull, images |
+| `DELETE` | `/v1/images/{name}` | Remove an image no berth uses, by its listed name |
 | `GET`, `POST` | `/v1/repos` | List, or mirror, repositories |
 | `DELETE` | `/v1/repos/{name}` | Remove a mirror no berth uses |
 | `GET`, `POST` | `/v1/layers` | List layers, or keep a berth's changes as one |

@@ -23,6 +23,24 @@ pub fn rootfs(images: &Path, reference: &str) -> PathBuf {
     images.join(Reference::parse(reference).key()).join("rootfs")
 }
 
+/// One pull or removal at a time: two of the same image would share a
+/// directory.
+static PULLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Removes the image kept under key (as `berth images` lists it).
+pub fn remove(images: &Path, key: &str) -> anyhow::Result<()> {
+    let _one = PULLING.lock().unwrap_or_else(|e| e.into_inner());
+    if key.is_empty() || key.contains('/') || key.starts_with('.') {
+        bail!("bad image name {key}");
+    }
+    let dir = images.join(key);
+    if !dir.join("rootfs").is_dir() {
+        bail!("no image {key}");
+    }
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
 /// Pulls reference into `images/<key>/rootfs`, unless it's there already.
 ///
 /// What a registry sent is handled with as little power as possible: it's
@@ -31,8 +49,6 @@ pub fn rootfs(images: &Path, reference: &str) -> PathBuf {
 /// the unprivileged ids userns maps to, with what it writes shifted back to
 /// ids from 0 on the way to disk.
 pub fn pull(images: &Path, reference: &str, userns: &OwnedFd) -> anyhow::Result<PathBuf> {
-    // One pull at a time: two of the same image would share a directory.
-    static PULLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = PULLING.lock().unwrap_or_else(|e| e.into_inner());
     let r = Reference::parse(reference);
     let dir = images.join(r.key());

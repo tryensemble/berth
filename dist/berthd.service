@@ -6,6 +6,9 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/berthd
+# How many berths this machine may hold (4096 by default); it sizes the host
+# ids berth reserves in /etc/subuid and /etc/subgid.
+#Environment=BERTH_MAX_BERTHS=4096
 Restart=on-failure
 # Berths run in their own cgroups under /sys/fs/cgroup/berth, not the
 # service's: restarting or stopping the daemon leaves them running.
