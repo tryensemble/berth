@@ -342,6 +342,34 @@ strict mode avoids. Running Docker's containers themselves under gVisor (its
 `runsc` runtime) is future work; for now a berth is either strict or runs
 Docker, not both.
 
+## A screen in a berth
+
+A berth with the desktop layer (`layers/desktop.sh`) has a screen: an X
+server with no hardware behind it (Xvfb, display `:0`, 1920×1080 unless
+`BERTH_DESKTOP_SIZE` says otherwise), a window manager, and Google Chrome.
+`berth-desktop` runs all of it as the berth's `desktop` service, started by
+`berth desktop` or `berth screenshot` the first time either is used, and kept
+running like any service. `berth-browser` starts a screen too when there's
+none, so an agent in the berth needn't ask for one. There's one screen at a
+time: each holds a lock, and a second waits on it until the first stops.
+Everything listens on the berth's own loopback:
+
+- `5900`: VNC (x11vnc), and `6080`: the same through noVNC, a page that shows
+  the screen in a browser and passes mouse and keyboard back. `berth desktop`
+  forwards 6080 to the host's `127.0.0.1`, through the API socket like
+  `forward`, so nothing is published.
+- `9222`: Chrome's DevTools, when it's started with `berth-browser`, for
+  Playwright, Puppeteer or an agent's browser tools inside the berth, or
+  outside through `proxy`.
+
+`berth screenshot` runs `scrot` in the berth and copies the PNG out over the
+exec stream. Chrome keeps its own sandbox: it makes user namespaces inside the
+berth's, which the berth allows (the host must not forbid unprivileged user
+namespaces to processes, as Ubuntu's AppArmor setting
+`apparmor_restrict_unprivileged_userns` does). The screen is ordinary
+processes in the berth's cgroup: it counts against the berth's memory (give
+it 2G for Chrome), and freezes with it when idle; a screenshot wakes it.
+
 ## Agents in the berth
 
 Claude Code, Codex and the rest run **inside** the berth, as an ordinary user

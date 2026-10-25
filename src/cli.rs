@@ -156,6 +156,20 @@ pub enum Cmd {
         #[arg(long)]
         local: Option<u16>,
     },
+    /// Show a berth's screen (needs the desktop layer): starts it, then serves
+    /// a page to watch and use it on this machine's 127.0.0.1
+    Desktop {
+        id: String,
+        /// Local port for the page
+        #[arg(long, default_value_t = 6080)]
+        local: u16,
+    },
+    /// Save what's on a berth's screen as a PNG
+    Screenshot {
+        id: String,
+        #[arg(default_value = "screenshot.png")]
+        file: PathBuf,
+    },
     /// Print the path of a berth's SOCKS5 socket, where localhost is the berth,
     /// or serve it on a TCP address
     Socks {
@@ -470,18 +484,19 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
             let local = local.unwrap_or(port);
             let listener = TcpListener::bind(("127.0.0.1", local))?;
             eprintln!("berth: http://127.0.0.1:{local} -> berth {id} port {port}");
-            for client in listener.incoming() {
-                let Ok(client) = client else { continue };
-                let id = id.clone();
-                // Each connection on its own, so a slow one holds up no other;
-                // one that fails is reported and the forward goes on.
-                std::thread::spawn(move || match proxy(&Client::default(), &id, port) {
-                    Ok(conn) => {
-                        let _ = pipe::splice(client, conn);
-                    }
-                    Err(e) => eprintln!("berth: {e:#}"),
-                });
-            }
+            forward(listener, &id, port)
+        }
+        Cmd::Desktop { id, local } => {
+            start_desktop(&api, &id)?;
+            let listener = TcpListener::bind(("127.0.0.1", local))?;
+            println!("http://127.0.0.1:{local}/vnc.html?autoconnect=1&resize=scale");
+            forward(listener, &id, DESKTOP_PORT)
+        }
+        Cmd::Screenshot { id, file } => {
+            start_desktop(&api, &id)?;
+            let png = capture(&api, &id)?;
+            std::fs::write(&file, png).with_context(|| format!("writing {}", file.display()))?;
+            eprintln!("berth: saved {}", file.display());
             Ok(0)
         }
         Cmd::Socks { id, listen } => {
@@ -643,6 +658,96 @@ impl Drop for Raw {
 }
 
 /// Runs spec in a berth, wired to this process's stdio. Returns its exit code.
+/// Serves connections to listener from port in berth id, until killed.
+fn forward(listener: TcpListener, id: &str, port: u16) -> anyhow::Result<i32> {
+    for client in listener.incoming() {
+        let Ok(client) = client else { continue };
+        let id = id.to_string();
+        // Each connection on its own, so a slow one holds up no other;
+        // one that fails is reported and the forward goes on.
+        std::thread::spawn(move || match proxy(&Client::default(), &id, port) {
+            Ok(conn) => {
+                let _ = pipe::splice(client, conn);
+            }
+            Err(e) => eprintln!("berth: {e:#}"),
+        });
+    }
+    Ok(0)
+}
+
+/// Runs argv in berth id, with no input; its exit code and what it printed.
+fn run_in(api: &Client, id: &str, argv: &[&str]) -> anyhow::Result<(i32, Vec<u8>)> {
+    collect(api, id, ExecSpec { argv: argv.iter().map(|a| a.to_string()).collect(), ..Default::default() })
+}
+
+/// Runs spec in berth id with no input, keeping its stdout (stderr goes to
+/// ours). A detached command or service counts as done once it started.
+fn collect(api: &Client, id: &str, spec: ExecSpec) -> anyhow::Result<(i32, Vec<u8>)> {
+    let detach = spec.detach;
+    let mut conn = api.upgrade(&format!("/v1/berths/{id}/exec"), &serde_json::to_value(&spec)?)?;
+    // No input. If the daemon already answered and closed (an error, say),
+    // that answer is read below.
+    let _ = frames::write_frame(&mut conn, frames::EOF, &[]);
+    let mut out = Vec::new();
+    loop {
+        match frames::read_frame(&mut conn)? {
+            Some((frames::STDOUT, d)) => out.extend_from_slice(&d),
+            Some((frames::STDERR, d)) => std::io::stderr().write_all(&d)?,
+            Some((frames::STARTED, _)) if detach => return Ok((0, out)),
+            Some((frames::ERROR, d)) => bail!("{}", String::from_utf8_lossy(&d)),
+            Some((frames::EXIT, d)) if d.len() == 4 => return Ok((i32::from_be_bytes(d.try_into().unwrap()), out)),
+            Some(_) => {}
+            None => return Ok((255, out)),
+        }
+    }
+}
+
+/// Where the desktop layer serves its screen's page (noVNC), in the berth.
+const DESKTOP_PORT: u16 = 6080;
+
+/// Starts berth id's screen as its `desktop` service, unless it runs already,
+/// and waits until its page answers.
+fn start_desktop(api: &Client, id: &str) -> anyhow::Result<()> {
+    let services = api.json("GET", &format!("/v1/berths/{id}/services"), None)?;
+    let running = services.as_array().into_iter().flatten().any(|s| s["service"] == "desktop");
+    if !running {
+        let has_layer = run_in(api, id, &["sh", "-c", "command -v berth-desktop"])?.0 == 0;
+        if !has_layer {
+            bail!("berth {id} has no screen: make it with the desktop layer (layers/desktop.sh)");
+        }
+        let spec = ExecSpec {
+            argv: vec!["berth-desktop".into()],
+            service: Some("desktop".into()),
+            detach: true,
+            ..Default::default()
+        };
+        let (code, _) = collect(api, id, spec)?;
+        if code != 0 {
+            bail!("couldn't start berth {id}'s screen");
+        }
+    }
+    for _ in 0..100 {
+        if proxy(api, id, DESKTOP_PORT).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("berth {id}'s screen didn't start; see `berth logs {id} desktop`")
+}
+
+/// A PNG of what's on berth id's screen.
+fn capture(api: &Client, id: &str) -> anyhow::Result<Vec<u8>> {
+    // The screen may still be coming up (its service taking over from one
+    // that stopped), so wait for it a little.
+    let shot = "export DISPLAY=:0; for _ in $(seq 100); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done; \
+                f=$(mktemp --suffix=.png) && scrot -o \"$f\" && cat \"$f\"; s=$?; rm -f \"$f\"; exit $s";
+    let (code, png) = run_in(api, id, &["sh", "-c", shot])?;
+    if code != 0 || !png.starts_with(b"\x89PNG") {
+        bail!("couldn't take a screenshot of berth {id}");
+    }
+    Ok(png)
+}
+
 fn exec(api: &Client, id: &str, spec: ExecSpec) -> anyhow::Result<i32> {
     let detach = spec.detach;
     let tty = spec.tty;

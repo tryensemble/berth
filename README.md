@@ -89,6 +89,7 @@ machines.
 | **Rest when unused** | A berth nobody uses is frozen and its memory pushed out: no CPU, about a megabyte. Any use wakes it in milliseconds, with its programs where they were. After a long time unused it's stopped; it starts again in a fraction of a second. |
 | **Services** | Commands started with `--service` are kept running and started again whenever the berth starts. |
 | **Docker** | Each berth can run its own Docker (its own layer), started on first use. Containers count against the berth's limits, serve on the berth's ports, and no other berth sees them. Pulls go through the tenant's registry mirror. |
+| **A screen** | With the desktop layer, a virtual screen with Google Chrome on it, started on first use. An agent drives Chrome through DevTools on the berth's port 9222 and takes screenshots; you watch and use the screen in your own browser. It freezes and wakes with the berth. |
 | **Snapshots and forks** | A berth's files, services and Docker state at a moment, taken while it's frozen. Restore goes back to one; fork makes a new berth from one. On XFS or btrfs they're reflinks: instant and free until something changes. |
 | **Ways in** | Its own SOCKS5 socket where `localhost` is the berth, published host ports, and host ports it may reach (a secrets proxy). |
 | **Strict mode** | `--strict` runs the berth's commands under gVisor, a user-space kernel, so a host-kernel bug reachable from inside can't break out. Everything else about the berth is unchanged. |
@@ -123,6 +124,8 @@ berth layer build tools layers/tools.sh
 berth layer build docker layers/docker.sh --from tools
 # And gVisor, for strict berths (berth create --strict).
 berth layer build gvisor layers/gvisor.sh --from tools
+# And a screen with Chrome, for berths that use a browser.
+berth layer build desktop layers/desktop.sh --from tools
 
 # A project, mirrored once; each berth gets its own branch of it.
 berth repo add web https://github.com/you/web
@@ -137,6 +140,12 @@ berth logs "$a" dev
 berth ports "$a"                       # 3000
 berth forward "$b" 3000 --local 3001   # b's :3000 at http://127.0.0.1:3001
 
+# A berth with a screen: Chrome on it, a screenshot, and a page to watch it.
+c=$(berth create --layer tools --layer desktop --memory 2G)
+berth exec -d "$c" -- berth-browser https://example.com
+berth screenshot "$c" shot.png
+berth desktop "$c"                     # http://127.0.0.1:6080/vnc.html?...
+
 # Run an agent inside a berth.
 berth exec -t -e ANTHROPIC_API_KEY "$a" -- claude
 
@@ -145,7 +154,7 @@ berth idle "$b"
 berth ls                               # b: idle, ~1M of memory
 berth ports "$b"; berth exec "$b" -- true   # any use wakes it
 
-berth destroy "$a" "$b"
+berth destroy "$a" "$b" "$c"
 ```
 
 Idle berths' memory goes to swap, so give the machine some. With zswap in
@@ -168,6 +177,8 @@ echo 1 | sudo tee /sys/module/zswap/parameters/enabled
 | `berth ports ID` | The TCP ports something listens on in a berth |
 | `berth proxy ID PORT` | Connect stdin and stdout to a port in a berth, for use as an SSH `ProxyCommand` and the like |
 | `berth forward ID PORT` | Serve a berth's port on this machine's `127.0.0.1` |
+| `berth desktop ID` | Start a berth's screen (desktop layer) and serve a page to watch and use it on this machine's `127.0.0.1` (`--local PORT`, 6080 by default) |
+| `berth screenshot ID [FILE]` | Save what's on a berth's screen as a PNG (`screenshot.png` by default) |
 | `berth socks ID` | The berth's SOCKS5 socket, where `localhost` is the berth (`--listen ADDR` serves it on TCP) |
 | `berth publish\|unpublish ID PORT` | Serve a berth's port on a host port (`--host-port`, `--address`), kept across restarts |
 | `berth idle\|stop\|start ID...` | Freeze berths, stop them, or start them again |
