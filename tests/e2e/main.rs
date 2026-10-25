@@ -11,6 +11,7 @@
 //! in parallel, as berths on a busy machine would.
 
 mod basics;
+mod desktop;
 mod docker;
 mod ensemble;
 mod hardening;
